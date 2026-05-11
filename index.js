@@ -89,6 +89,30 @@ const server = http.createServer((req, res) => {
         req.on('end', () => {
             try {
                 const json = JSON.parse(body);
+
+                // 1. Normalize 'input' array items (Pedantic requirement by llama-server)
+                if (Array.isArray(json.input)) {
+                    json.input = json.input.map(item => {
+                        // Normalize content parts in messages
+                        if (Array.isArray(item.content)) {
+                            item.content = item.content.map(part => {
+                                if (part.type === 'text') part.type = 'input_text';
+                                if (part.type === 'image_url') part.type = 'input_image';
+                                return part;
+                            });
+                        }
+                        // Normalize tool outputs
+                        if (item.type === 'function_call_output' && Array.isArray(item.output)) {
+                            item.output = item.output.map(part => {
+                                if (part.type === 'text' || !part.type) part.type = 'input_text';
+                                return part;
+                            });
+                        }
+                        return item;
+                    });
+                }
+
+                // 2. Patch tools array (Flattening)
                 if (Array.isArray(json.tools)) {
                     json.tools = json.tools.filter(t => {
                         if (t.type === 'function' || t.function) {
@@ -106,6 +130,7 @@ const server = http.createServer((req, res) => {
                         return false;
                     });
                 }
+                
                 const patchedBody = JSON.stringify(json);
                 proxyReq.setHeader('content-length', Buffer.byteLength(patchedBody));
                 
