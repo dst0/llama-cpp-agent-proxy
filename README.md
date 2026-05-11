@@ -16,7 +16,7 @@ A high-performance, transparent compatibility bridge between **Codex** (and othe
 2. Run your `llama-server` on port `11435`.
 3. Start the proxy:
    ```bash
-   node index.mjs
+   node index.js
    ```
 4. Point your client to `http://<your-ip>:11437/v1`.
 

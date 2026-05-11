@@ -2,10 +2,10 @@
   "name": "llama-cpp-agent-proxy",
   "version": "1.0.0",
   "description": "Transparent agentic bridge for llama.cpp",
-  "main": "index.mjs",
+  "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node index.mjs"
+    "start": "node index.js"
   },
   "keywords": ["llama.cpp", "proxy", "openai", "agentic", "tool-calling"],
   "author": "",
