@@ -1,4 +1,4 @@
-# llama-cpp-codex-proxy
+# llama-cpp-agent-proxy
 
 A high-performance, transparent compatibility bridge between **Codex** (and other OpenAI-compatible agents) and **llama-server**.
 
