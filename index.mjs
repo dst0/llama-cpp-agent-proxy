@@ -1,11 +1,15 @@
-// codex-llamacpp-proxy.mjs
 import http from "node:http";
 
-const TARGET_HOST = '127.0.0.1';
-const TARGET_PORT = 11435;
-const PROXY_PORT = 11437;
+/**
+ * llama-cpp-agent-proxy
+ * A transparent compatibility bridge between OpenAI Responses API clients and llama-server.
+ */
 
-// A truly exhaustive mirror template containing every field Codex might expect.
+const TARGET_HOST = process.env.TARGET_HOST || '127.0.0.1';
+const TARGET_PORT = parseInt(process.env.TARGET_PORT || '11435', 10);
+const PROXY_PORT = parseInt(process.env.PORT || '11437', 10);
+
+// A robust "Base Template" for model metadata to ensure all required fields are present for clients.
 const MODEL_TEMPLATE = {
     "slug": "local-model",
     "display_name": "Local Model",
@@ -57,21 +61,17 @@ const server = http.createServer((req, res) => {
                 try {
                     const json = JSON.parse(data);
                     if (Array.isArray(json.models)) {
-                        json.models = json.models.map(m => {
-                            // Perfect Mirror: Template base + Model specifics
-                            return { 
-                                ...MODEL_TEMPLATE, 
-                                ...m,
-                                slug: m.slug || m.name || m.model || MODEL_TEMPLATE.slug,
-                                display_name: m.display_name || m.name || m.model || MODEL_TEMPLATE.display_name
-                            };
-                        });
+                        json.models = json.models.map(m => ({ 
+                            ...MODEL_TEMPLATE, 
+                            ...m,
+                            slug: m.slug || m.name || m.model || MODEL_TEMPLATE.slug,
+                            display_name: m.display_name || m.name || m.model || MODEL_TEMPLATE.display_name
+                        }));
                     }
                     const body = JSON.stringify(json);
                     const headers = { ...proxyRes.headers, 'content-length': Buffer.byteLength(body) };
                     res.writeHead(proxyRes.statusCode, headers);
                     res.end(body);
-                    console.log(`[Proxy] Exhaustive Mirror /v1/models (Updated reasoning levels)`);
                 } catch (e) {
                     res.writeHead(proxyRes.statusCode, proxyRes.headers);
                     res.end(data);
@@ -160,5 +160,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PROXY_PORT, "0.0.0.0", () => {
-    console.log(`[Contract Proxy] Exhaustive Mirror on 0.0.0.0:${PROXY_PORT}`);
+    console.log(`[llama-cpp-agent-proxy] Listening on 0.0.0.0:${PROXY_PORT} -> ${TARGET_HOST}:${TARGET_PORT}`);
 });
