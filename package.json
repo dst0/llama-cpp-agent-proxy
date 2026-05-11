@@ -1,5 +1,5 @@
 {
-  "name": "llama-cpp-agentic-proxy",
+  "name": "llama-cpp-codex-proxy",
   "version": "1.0.0",
   "description": "Transparent agentic bridge for llama.cpp",
   "main": "index.mjs",
