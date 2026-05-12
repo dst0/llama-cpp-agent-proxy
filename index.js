@@ -102,7 +102,7 @@ function normalizeToolOutput(output) {
     }).filter(Boolean);
 }
 
-function normalizeResponseContentPart(part) {
+function normalizeResponseContentPart(part, { preserveReasoning = false } = {}) {
     if (typeof part === 'string') {
         return { type: 'output_text', text: part };
     }
@@ -114,7 +114,7 @@ function normalizeResponseContentPart(part) {
     }
 
     if (part.type === 'reasoning' || part.type === 'reasoning_text' || part.type === 'summary_text') {
-        return null;
+        return preserveReasoning ? part : null;
     }
 
     if (part.type === 'output_text' || part.type === 'text' || !part.type) {
@@ -125,22 +125,26 @@ function normalizeResponseContentPart(part) {
     return null;
 }
 
-function normalizeResponseItem(item) {
+function normalizeResponseItem(item, { preserveReasoning = false } = {}) {
     if (!item || typeof item !== 'object') return item;
 
     if (item.type === 'reasoning') {
-        if (!item.summary) {
+        if (!preserveReasoning && !item.summary) {
             item.summary = [{ type: 'summary_text', text: 'Reasoning trace...' }];
         }
-        return null;
+        return preserveReasoning ? item : null;
     }
 
     if (Array.isArray(item.content)) {
         item.content = item.content
-            .map(part => normalizeResponseContentPart(part))
+            .map(part => normalizeResponseContentPart(part, { preserveReasoning }))
             .filter(Boolean);
     } else if (typeof item.content === 'string') {
         item.content = [{ type: 'output_text', text: item.content }];
+    }
+
+    if (!preserveReasoning && Array.isArray(item.content) && item.content.length === 0) {
+        return null;
     }
 
     return item;
@@ -148,14 +152,22 @@ function normalizeResponseItem(item) {
 
 function normalizeResponseJson(resJson) {
     if (Array.isArray(resJson.output)) {
-        resJson.output = resJson.output
+        const normalizedOutput = resJson.output
             .map(item => normalizeResponseItem(item))
+            .filter(Boolean);
+
+        resJson.output = normalizedOutput.length > 0 ? normalizedOutput : resJson.output
+            .map(item => normalizeResponseItem(item, { preserveReasoning: true }))
             .filter(Boolean);
     }
 
     if (Array.isArray(resJson.content)) {
-        resJson.content = resJson.content
+        const normalizedContent = resJson.content
             .map(part => normalizeResponseContentPart(part))
+            .filter(Boolean);
+
+        resJson.content = normalizedContent.length > 0 ? normalizedContent : resJson.content
+            .map(part => normalizeResponseContentPart(part, { preserveReasoning: true }))
             .filter(Boolean);
     } else if (typeof resJson.content === 'string') {
         resJson.content = [{ type: 'output_text', text: resJson.content }];
@@ -187,6 +199,24 @@ function normalizeInputItem(item) {
             delete item.content;
         }
         item.output = normalizeToolOutput(item.output);
+        
+        if (Array.isArray(item.output)) {
+            const hasImage = item.output.some(p => p.type === 'input_image');
+            if (hasImage) {
+                const textParts = item.output.filter(p => p.type === 'input_text');
+                const imageParts = item.output.filter(p => p.type === 'input_image');
+                
+                if (textParts.length === 0) {
+                    textParts.push({ type: 'input_text', text: '(Image output provided)' });
+                }
+                
+                item.output = textParts;
+                return [
+                    item,
+                    { type: 'message', role: 'user', content: imageParts }
+                ];
+            }
+        }
         return item;
     }
 
@@ -254,28 +284,36 @@ const server = http.createServer((req, res) => {
     const isModels = req.method === 'GET' && req.url.startsWith('/v1/models');
     const isResponses = req.method === 'POST' && req.url.startsWith('/v1/responses');
 
-    const createProxyReq = (options = {}) => {
+    const getTargetPortForModel = (modelName) => {
+        if (modelName === 'qwen2.5-0.5b') return 11438;
+        return TARGET_PORT;
+    };
+
+    const createProxyReq = (options = {}, targetPort = TARGET_PORT) => {
         const cleanHeaders = { ...req.headers };
         delete cleanHeaders['host'];
         delete cleanHeaders['content-length'];
         delete cleanHeaders['transfer-encoding'];
         delete cleanHeaders['connection'];
 
+        const { headers: extraHeaders = {}, ...restOptions } = options;
+
         const proxyReq = http.request({
             hostname: TARGET_HOST,
-            port: TARGET_PORT,
+            port: targetPort,
             path: req.url,
             method: req.method,
             headers: { 
                 ...cleanHeaders, 
-                'host': `${TARGET_HOST}:${TARGET_PORT}`,
-                'connection': 'keep-alive'
+                'host': `${TARGET_HOST}:${targetPort}`,
+                'connection': 'keep-alive',
+                ...extraHeaders
             },
-            ...options
+            ...restOptions
         });
         
         proxyReq.on('error', (err) => {
-            error(`Upstream Error (${req.method} ${req.url}): ${err.message}`);
+            error(`Upstream Error (${req.method} ${req.url} -> ${targetPort}): ${err.message}`);
             if (!res.headersSent) {
                 res.writeHead(502, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: "Upstream server unavailable", details: err.message }));
@@ -287,7 +325,7 @@ const server = http.createServer((req, res) => {
     };
 
     // Helper to fetch server properties dynamically
-    const getUpstreamProps = () => {
+    const getUpstreamProps = (port = TARGET_PORT) => {
         return new Promise((resolve) => {
             let settled = false;
             const finish = (value = {}) => {
@@ -296,7 +334,7 @@ const server = http.createServer((req, res) => {
                 resolve(value);
             };
 
-            const propsReq = http.get(`http://${TARGET_HOST}:${TARGET_PORT}/props`, (propsRes) => {
+            const propsReq = http.get(`http://${TARGET_HOST}:${port}/props`, (propsRes) => {
                 let data = '';
                 propsRes.on('data', c => data += c);
                 propsRes.on('end', () => {
@@ -318,44 +356,64 @@ const server = http.createServer((req, res) => {
     };
 
     if (isModels) {
-        const proxyReq = createProxyReq();
-        proxyReq.on('response', (proxyRes) => {
-            let bodyChunks = [];
-            proxyRes.on('data', chunk => bodyChunks.push(chunk));
-            proxyRes.on('end', async () => {
-                const data = Buffer.concat(bodyChunks).toString();
-                const props = await getUpstreamProps();
-                
-                try {
-                    const json = JSON.parse(data);
-                    if (Array.isArray(json.models)) {
-                        json.models = json.models.map(m => {
-                            const capabilities = ["completion"];
-                            if (props.modalities?.vision) capabilities.push("multimodal", "vision");
-                            
-                            return { 
-                                ...MODEL_TEMPLATE, 
-                                ...m,
-                                slug: m.slug || m.name || m.model || MODEL_TEMPLATE.slug,
-                                display_name: m.display_name || m.name || m.model || MODEL_TEMPLATE.display_name,
-                                capabilities: capabilities
-                            };
-                        });
-                    }
-                    const body = JSON.stringify(json);
-                    const headers = { ...proxyRes.headers };
-                    delete headers['content-length'];
-                    delete headers['transfer-encoding'];
-                    headers['content-length'] = Buffer.byteLength(body);
-                    res.writeHead(proxyRes.statusCode, headers);
-                    res.end(body);
-                } catch (e) {
-                    res.writeHead(proxyRes.statusCode, proxyRes.headers);
-                    res.end(data);
-                }
+        const ports = [TARGET_PORT, 11438];
+        Promise.all(ports.map(port => {
+            return new Promise((resolve) => {
+                const proxyReq = http.request({
+                    hostname: TARGET_HOST,
+                    port: port,
+                    path: req.url,
+                    method: req.method,
+                    headers: { 'host': `${TARGET_HOST}:${port}` }
+                });
+                proxyReq.on('response', (proxyRes) => {
+                    let bodyChunks = [];
+                    proxyRes.on('data', chunk => bodyChunks.push(chunk));
+                    proxyRes.on('end', async () => {
+                        const data = Buffer.concat(bodyChunks).toString();
+                        const props = await getUpstreamProps(port);
+                        try {
+                            const json = JSON.parse(data);
+                            resolve({ json, props, statusCode: proxyRes.statusCode });
+                        } catch (e) {
+                            resolve(null);
+                        }
+                    });
+                });
+                proxyReq.on('error', () => resolve(null));
+                proxyReq.end();
             });
+        })).then(results => {
+            let allModels = [];
+            let statusCode = 502;
+            for (const result of results) {
+                if (result && result.json && Array.isArray(result.json.models)) {
+                    statusCode = 200;
+                    const enhancedModels = result.json.models.map(m => {
+                        const capabilities = ["completion"];
+                        if (result.props.modalities?.vision) capabilities.push("multimodal", "vision");
+                        
+                        return { 
+                            ...MODEL_TEMPLATE, 
+                            ...m,
+                            slug: m.slug || m.name || m.model || MODEL_TEMPLATE.slug,
+                            display_name: m.display_name || m.name || m.model || MODEL_TEMPLATE.display_name,
+                            capabilities: capabilities
+                        };
+                    });
+                    allModels = allModels.concat(enhancedModels);
+                }
+            }
+
+            if (statusCode === 200) {
+                const body = JSON.stringify({ object: "list", models: allModels });
+                res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+                res.end(body);
+            } else {
+                res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: "No upstream servers available" }));
+            }
         });
-        proxyReq.end();
         return;
     }
 
@@ -366,10 +424,11 @@ const server = http.createServer((req, res) => {
             const body = Buffer.concat(bodyChunks).toString();
             try {
                 const json = JSON.parse(body);
-                log(`[Proxy] Request: ${json.model} (stream=${!!json.stream})`);
+                const targetPort = getTargetPortForModel(json.model);
+                log(`[Proxy] Request: ${json.model} (stream=${!!json.stream}) -> port ${targetPort}`);
 
                 if (Array.isArray(json.input)) {
-                    json.input = json.input.map(item => {
+                    json.input = json.input.flatMap(item => {
                         return normalizeInputItem(item);
                     }).filter(Boolean);
                 }
@@ -393,8 +452,9 @@ const server = http.createServer((req, res) => {
                 }
                 
                 const patchedBody = JSON.stringify(json);
-                const proxyReq = createProxyReq();
-                proxyReq.setHeader('content-length', Buffer.byteLength(patchedBody));
+                const proxyReq = createProxyReq({
+                    headers: { 'content-length': Buffer.byteLength(patchedBody) }
+                }, targetPort);
                 
                 proxyReq.on('response', (proxyRes) => {
                     if (!json.stream) {
@@ -427,6 +487,7 @@ const server = http.createServer((req, res) => {
                 proxyReq.end();
             } catch (e) {
                 log(`[Proxy] Failed to patch request, falling back: ${e.message}`);
+                // fallback route uses default port
                 const proxyReq = createProxyReq();
                 proxyReq.on('response', (proxyRes) => {
                     res.writeHead(proxyRes.statusCode, proxyRes.headers);
