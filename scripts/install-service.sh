@@ -51,6 +51,17 @@ if [[ -z "${NODE_BIN}" ]]; then
     exit 1
 fi
 
+kill_proxy_processes() {
+    local pids
+    pids="$(ps -eo pid=,command= | awk -v root="${ROOT_DIR}/index.js" '$0 ~ root {print $1}')"
+
+    if [[ -n "${pids}" ]]; then
+        for pid in ${pids}; do
+            kill "${pid}" 2>/dev/null || true
+        done
+    fi
+}
+
 install_launchd() {
     local plist_dir="${HOME}/Library/LaunchAgents"
     local plist_path="${plist_dir}/${LABEL}.plist"
@@ -89,10 +100,11 @@ install_launchd() {
     <key>StandardErrorPath</key>
     <string>${ROOT_DIR}/proxy.log</string>
 </dict>
-</plist>
+    </plist>
 EOF
 
     launchctl bootout "gui/$(id -u)" "${plist_path}" >/dev/null 2>&1 || true
+    kill_proxy_processes
     launchctl bootstrap "gui/$(id -u)" "${plist_path}"
     launchctl enable "gui/$(id -u)/${LABEL}"
     launchctl kickstart -k "gui/$(id -u)/${LABEL}"
@@ -126,8 +138,12 @@ RestartSec=2
 WantedBy=default.target
 EOF
 
+    systemctl --user stop "${SERVICE_UNIT}" >/dev/null 2>&1 || true
+    kill_proxy_processes
     systemctl --user daemon-reload
-    systemctl --user enable --now "${SERVICE_UNIT}"
+    systemctl --user enable "${SERVICE_UNIT}" >/dev/null 2>&1 || true
+    systemctl --user start "${SERVICE_UNIT}"
+    systemctl --user is-active --quiet "${SERVICE_UNIT}"
 
     echo "Installed systemd user service: ${unit_path}"
 }
@@ -144,4 +160,3 @@ case "${OS_NAME}" in
         exit 1
         ;;
 esac
-

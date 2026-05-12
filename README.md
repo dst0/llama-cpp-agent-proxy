@@ -29,6 +29,9 @@ Use the installer to register the proxy as a user service on macOS (LaunchAgent)
 bash scripts/install-service.sh
 ```
 
+Running the installer again performs a clean reinstall: it stops the existing service, kills any running
+proxy process for this repo, and starts the service again with the updated configuration.
+
 You can override the defaults with `TARGET_HOST`, `TARGET_PORT`, `PORT`, or `--service-name`.
 
 To remove the service again:
