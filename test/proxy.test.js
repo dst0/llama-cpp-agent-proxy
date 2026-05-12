@@ -476,6 +476,56 @@ test('Proxy should normalize assistant response content', async () => {
     }
 });
 
+test('Proxy should drop empty assistant messages', async () => {
+    const mockUpstream = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            output: [
+                {
+                    id: 'msg_1',
+                    type: 'message',
+                    role: 'assistant',
+                    status: 'completed',
+                    content: [
+                        { type: 'reasoning_text', text: 'Thinking only.' }
+                    ]
+                }
+            ]
+        }));
+    });
+
+    const proxy = startProxy();
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    try {
+        const req = http.request({
+            hostname: 'localhost',
+            port: PROXY_PORT,
+            path: '/v1/responses',
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        req.write(JSON.stringify({ model: 'test', input: [] }));
+        req.end();
+
+        let data = '';
+        await new Promise((resolve, reject) => {
+            req.on('response', (res) => {
+                res.on('data', chunk => data += chunk);
+                res.on('end', resolve);
+            });
+            req.on('error', reject);
+        });
+
+        const json = JSON.parse(data);
+        assert.deepStrictEqual(json.output, []);
+    } finally {
+        proxy.kill();
+        mockUpstream.close();
+    }
+});
+
 test('Proxy should inject model metadata', async (t) => {
     const mockUpstream = await startMockUpstream((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
