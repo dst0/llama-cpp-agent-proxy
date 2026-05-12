@@ -46,6 +46,40 @@ const MODEL_TEMPLATE = {
     "service_tiers": [{ "id": "priority", "name": "Fast", "description": "Local priority" }]
 };
 
+function normalizeContentPart(part) {
+    if (!part || typeof part !== 'object') return part;
+
+    if (part.type === 'text' || part.type === 'output_text' || !part.type) {
+        part.type = 'input_text';
+    }
+
+    if (part.type === 'image_url' || (part.type === 'image' && part.image_url)) {
+        part.type = 'input_image';
+        const url = typeof part.image_url === 'object' ? part.image_url.url : part.image_url;
+        part.image_url = url;
+    }
+
+    return part;
+}
+
+function normalizeToolOutput(output) {
+    if (typeof output === 'string') {
+        return [{ type: 'input_text', text: output }];
+    }
+
+    if (!Array.isArray(output)) {
+        return output;
+    }
+
+    return output.map(part => {
+        if (typeof part === 'string') {
+            return { type: 'input_text', text: part };
+        }
+
+        return normalizeContentPart(part);
+    });
+}
+
 const server = http.createServer((req, res) => {
     const isModels = req.method === 'GET' && req.url.startsWith('/v1/models');
     const isResponses = req.method === 'POST' && req.url.startsWith('/v1/responses');
@@ -148,28 +182,36 @@ const server = http.createServer((req, res) => {
 
                 if (Array.isArray(json.input)) {
                     json.input = json.input.map(item => {
-                        // Normalize content parts in messages
-                        if (Array.isArray(item.content)) {
-                            item.content = item.content.map(part => {
-                                if (part.type === 'text') part.type = 'input_text';
-                                if (part.type === 'image_url') {
-                                    part.type = 'input_image';
-                                    const url = typeof part.image_url === 'object' ? part.image_url.url : part.image_url;
-                                    part.image_url = url;
-                                }
-                                return part;
-                            });
+                        if (item.role === 'tool' && item.type !== 'function_call_output') {
+                            item.type = 'function_call_output';
+                            if (!item.call_id && item.tool_call_id) item.call_id = item.tool_call_id;
+                            if (item.output === undefined && item.content !== undefined) {
+                                item.output = item.content;
+                                delete item.content;
+                            }
+                            delete item.role;
+                            delete item.tool_call_id;
+                        } else if (item.type !== 'function_call_output') {
+                            item.type = 'message';
+                            if (!item.role) item.role = 'assistant';
                         }
-                        // Normalize tool outputs
-                        if (item.type === 'function_call_output' && Array.isArray(item.output)) {
-                            item.output = item.output.map(part => {
-                                if (part.type === 'text' || !part.type) part.type = 'input_text';
-                                return part;
-                            });
+
+                        log(`[Proxy] Debug: Processing item: ${JSON.stringify(item)}`);
+
+                        if (item.type === 'function_call_output') {
+                            if (item.output === undefined && item.content !== undefined) {
+                                item.output = item.content;
+                                delete item.content;
+                            }
+                            item.output = normalizeToolOutput(item.output);
+                        } else if (Array.isArray(item.content)) {
+                            item.content = item.content.map(normalizeContentPart);
+                        } else if (typeof item.content === 'string') {
+                            item.content = [{ type: 'input_text', text: item.content }];
                         }
+
                         return item;
                     });
-                }
                 }
 
                 if (Array.isArray(json.tools)) {
