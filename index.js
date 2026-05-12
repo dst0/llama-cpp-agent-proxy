@@ -39,7 +39,7 @@ const MODEL_TEMPLATE = {
     "supported_in_api": true,
     "capabilities": ["completion", "multimodal", "vision"],
     "priority": 0,
-    "max_context_window": 131072,
+    "max_context_window": 65536,
     "base_instructions": "",
     "instructions_variables": {},
     "additional_speed_tiers": ["fast"],
