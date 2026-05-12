@@ -40,6 +40,9 @@ To remove the service again:
 bash scripts/uninstall-service.sh
 ```
 
+Uninstall performs a clean shutdown too: it stops the managed service and kills any running proxy
+process for this repo before removing the user service definition.
+
 ## Multimodal image input
 
 For image requests, use a vision-capable `llama-server` model with a matching `--mmproj`.

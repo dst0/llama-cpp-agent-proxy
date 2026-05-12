@@ -36,6 +36,7 @@ uninstall_launchd() {
     local plist_path="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 
     launchctl bootout "gui/$(id -u)" "${plist_path}" >/dev/null 2>&1 || true
+    kill_proxy_processes
     rm -f "${plist_path}"
 
     echo "Removed LaunchAgent: ${plist_path}"
