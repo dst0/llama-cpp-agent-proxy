@@ -277,8 +277,102 @@ function normalizeInputItem(item) {
     return item;
 }
 
-function createSseNormalizer(proxyRes, res, { onRawEvent, onNormalizedEvent } = {}) {
+/**
+ * When a streaming agentic response ends with only text (no tool calls), the
+ * model may have narrated an intention without actually calling a tool. This
+ * function fires a follow-up request to llama-server within the same open
+ * HTTP connection, asking the model to either act or confirm it is finished.
+ * Returns a promise that resolves with any function_call items extracted from
+ * the follow-up response (empty array if the model replied FINISHED or failed).
+ */
+function doFollowUp(originalJson, textContent, targetPort) {
+    return new Promise((resolve) => {
+        const followUpInput = [
+            ...(originalJson.input ?? []),
+            {
+                role: 'assistant',
+                content: [{ type: 'output_text', text: textContent }]
+            },
+            {
+                role: 'user',
+                content: [{
+                    type: 'input_text',
+                    text: 'You described an action but did not call a tool. If there is remaining work, call the appropriate tool now. If all work is genuinely complete, respond with only: FINISHED'
+                }]
+            }
+        ];
+
+        const followUpBody = JSON.stringify({
+            model: originalJson.model,
+            ...(originalJson.tools ? { tools: originalJson.tools } : {}),
+            ...(originalJson.instructions ? { instructions: originalJson.instructions } : {}),
+            ...(originalJson.temperature !== undefined ? { temperature: originalJson.temperature } : {}),
+            ...(originalJson.max_output_tokens ? { max_output_tokens: originalJson.max_output_tokens } : {}),
+            input: followUpInput,
+            stream: true,
+        });
+
+        const req = http.request({
+            hostname: TARGET_HOST,
+            port: targetPort,
+            path: '/v1/responses',
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'accept': 'text/event-stream',
+                'content-length': Buffer.byteLength(followUpBody),
+                'connection': 'keep-alive'
+            }
+        });
+
+        let buf = '';
+        let settled = false;
+        const done = (items) => { if (!settled) { settled = true; resolve(items); } };
+
+        req.on('response', (followUpRes) => {
+            followUpRes.setEncoding('utf8');
+            followUpRes.on('data', chunk => {
+                buf += chunk;
+                let bi;
+                while ((bi = buf.indexOf('\n\n')) !== -1) {
+                    const rawEvent = buf.slice(0, bi);
+                    buf = buf.slice(bi + 2);
+                    for (const line of rawEvent.split('\n')) {
+                        if (!line.startsWith('data:')) continue;
+                        const payload = line.slice(5).trimStart();
+                        if (!payload || payload === '[DONE]') continue;
+                        try {
+                            const parsed = JSON.parse(payload);
+                            logFull({ type: 'sse_followup', event: parsed });
+                            if (parsed.type === 'response.completed') {
+                                const output = parsed.response?.output ?? [];
+                                const fcItems = output.filter(i => i.type === 'function_call');
+                                const msgText = output
+                                    .find(i => i.type === 'message')
+                                    ?.content?.find(c => c.type === 'output_text')?.text ?? '';
+                                done(/^\s*FINISHED\s*$/i.test(msgText.trim()) ? [] : fcItems);
+                            }
+                        } catch {}
+                    }
+                }
+            });
+            followUpRes.on('end', () => done([]));
+        });
+
+        req.on('error', (err) => {
+            error(`[Proxy] Follow-up request failed: ${err.message}`);
+            done([]);
+        });
+        req.setTimeout(120000, () => { req.destroy(); done([]); });
+
+        req.write(followUpBody);
+        req.end();
+    });
+}
+
+function createSseNormalizer(proxyRes, res, { onRawEvent, onNormalizedEvent, onCompleted } = {}) {
     let buffer = '';
+    let pendingComplete = null;
 
     proxyRes.setEncoding('utf8');
     proxyRes.on('data', chunk => {
@@ -289,6 +383,7 @@ function createSseNormalizer(proxyRes, res, { onRawEvent, onNormalizedEvent } = 
             const rawEvent = buffer.slice(0, boundaryIndex);
             buffer = buffer.slice(boundaryIndex + 2);
 
+            let skipWrite = false;
             const normalizedEvent = rawEvent.split('\n').map(line => {
                 if (!line.startsWith('data:')) return line;
 
@@ -298,6 +393,11 @@ function createSseNormalizer(proxyRes, res, { onRawEvent, onNormalizedEvent } = 
                 try {
                     const parsed = JSON.parse(payload);
                     if (onRawEvent) onRawEvent(parsed);
+                    if (onCompleted && parsed.type === 'response.completed') {
+                        pendingComplete = parsed;
+                        skipWrite = true;
+                        return line;
+                    }
                     const normalized = normalizeResponseJson(parsed);
                     if (onNormalizedEvent) onNormalizedEvent(normalized);
                     return `data: ${JSON.stringify(normalized)}`;
@@ -306,7 +406,9 @@ function createSseNormalizer(proxyRes, res, { onRawEvent, onNormalizedEvent } = 
                 }
             }).join('\n');
 
-            res.write(normalizedEvent + '\n\n');
+            if (!skipWrite) {
+                res.write(normalizedEvent + '\n\n');
+            }
         }
     });
 
@@ -314,7 +416,16 @@ function createSseNormalizer(proxyRes, res, { onRawEvent, onNormalizedEvent } = 
         if (buffer) {
             res.write(buffer);
         }
-        res.end();
+        if (pendingComplete) {
+            onCompleted(pendingComplete).catch(err => {
+                error(`[Proxy] onCompleted error: ${err.message}`);
+                const normalized = normalizeResponseJson(pendingComplete);
+                res.write(`data: ${JSON.stringify(normalized)}\n\n`);
+                res.end();
+            });
+        } else {
+            res.end();
+        }
     });
 }
 
@@ -562,6 +673,47 @@ const server = http.createServer((req, res) => {
                             },
                             onNormalizedEvent(normalized) {
                                 logFull({ type: 'sse_proxy', model: json.model, event: normalized });
+                            },
+                            async onCompleted(completedEvent) {
+                                const output = completedEvent.response?.output ?? [];
+                                const hasFunctionCall = output.some(i => i.type === 'function_call');
+                                const textContent = output
+                                    .find(i => i.type === 'message')
+                                    ?.content?.find(c => c.type === 'output_text')?.text ?? '';
+                                const hasTools = Array.isArray(json.tools) && json.tools.length > 0;
+
+                                let mergedOutput = output;
+
+                                if (!hasFunctionCall && textContent && hasTools) {
+                                    log(`[Proxy] Text-only agentic response for ${json.model}; sending follow-up`);
+                                    const fcItems = await doFollowUp(json, textContent, targetPort);
+
+                                    if (fcItems.length > 0) {
+                                        log(`[Proxy] Follow-up injecting ${fcItems.length} function call(s) for ${json.model}`);
+                                        let outputIndex = output.length;
+                                        for (const fc of fcItems) {
+                                            const addedEvt = { type: 'response.output_item.added', output_index: outputIndex, item: { type: 'function_call', id: fc.id, call_id: fc.call_id, name: fc.name, arguments: '' } };
+                                            const deltaEvt = { type: 'response.function_call_arguments.delta', item_id: fc.id, output_index: outputIndex, delta: fc.arguments ?? '' };
+                                            const doneArgEvt = { type: 'response.function_call_arguments.done', item_id: fc.id, output_index: outputIndex, arguments: fc.arguments ?? '' };
+                                            const itemDoneEvt = { type: 'response.output_item.done', output_index: outputIndex, item: fc };
+                                            for (const evt of [addedEvt, deltaEvt, doneArgEvt, itemDoneEvt]) {
+                                                logFull({ type: 'sse_proxy', model: json.model, event: evt });
+                                                res.write(`data: ${JSON.stringify(evt)}\n\n`);
+                                            }
+                                            outputIndex++;
+                                        }
+                                        mergedOutput = [...output, ...fcItems];
+                                    }
+                                }
+
+                                const mergedCompleted = mergedOutput === output ? completedEvent : {
+                                    ...completedEvent,
+                                    response: { ...completedEvent.response, output: mergedOutput }
+                                };
+                                const normalized = normalizeResponseJson(mergedCompleted);
+                                logFull({ type: 'sse_proxy', model: json.model, event: normalized });
+                                res.write(`data: ${JSON.stringify(normalized)}\n\n`);
+                                res.end();
                             }
                         });
 

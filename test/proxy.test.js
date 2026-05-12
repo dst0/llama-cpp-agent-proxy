@@ -595,6 +595,60 @@ test('Proxy should strip reasoning outputs', async () => {
     }
 });
 
+test('Proxy should preserve reasoning-only outputs', async () => {
+    const mockUpstream = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            output: [
+                {
+                    id: 'rs_1',
+                    type: 'reasoning',
+                    content: [{ type: 'reasoning_text', text: 'Thinking...' }],
+                    summary: []
+                }
+            ]
+        }));
+    });
+
+    const proxy = startProxy();
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    try {
+        const req = http.request({
+            hostname: 'localhost',
+            port: PROXY_PORT,
+            path: '/v1/responses',
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        req.write(JSON.stringify({ model: 'test', input: [] }));
+        req.end();
+
+        let data = '';
+        await new Promise((resolve, reject) => {
+            req.on('response', (res) => {
+                res.on('data', chunk => data += chunk);
+                res.on('end', resolve);
+            });
+            req.on('error', reject);
+        });
+
+        const json = JSON.parse(data);
+        assert.deepStrictEqual(json.output, [
+            {
+                id: 'rs_1',
+                type: 'reasoning',
+                content: [{ type: 'reasoning_text', text: 'Thinking...' }],
+                summary: []
+            }
+        ]);
+    } finally {
+        proxy.kill();
+        mockUpstream.close();
+    }
+});
+
 test('Proxy should normalize assistant response content', async () => {
     const mockUpstream = await startMockUpstream((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -765,5 +819,245 @@ test('Proxy should honor LOG_FILE without logging request content', async () => 
         proxy.kill();
         mockUpstream.close();
         fs.rmSync(logFile, { force: true });
+    }
+});
+
+test('Proxy should inject follow-up tool call when agentic response has text but no tool call', async () => {
+    let upstreamCallCount = 0;
+
+    const mockUpstream = await startMockUpstream((req, res) => {
+        let chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+            upstreamCallCount++;
+            res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+
+            if (upstreamCallCount === 1) {
+                res.write('data: ' + JSON.stringify({
+                    type: 'response.completed',
+                    response: {
+                        id: 'resp_1', object: 'response', status: 'completed', model: 'test-model',
+                        output: [
+                            { type: 'message', id: 'msg_1', role: 'assistant', status: 'completed',
+                              content: [{ type: 'output_text', text: "I'll search for the file now." }] }
+                        ],
+                        usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 }
+                    }
+                }) + '\n\n');
+            } else {
+                res.write('data: ' + JSON.stringify({
+                    type: 'response.completed',
+                    response: {
+                        id: 'resp_2', object: 'response', status: 'completed', model: 'test-model',
+                        output: [
+                            { type: 'function_call', id: 'fc_1', call_id: 'call_abc', name: 'shell', arguments: '{"command":"grep -r foo ."}' }
+                        ],
+                        usage: { input_tokens: 200, output_tokens: 30, total_tokens: 230 }
+                    }
+                }) + '\n\n');
+            }
+            res.end();
+        });
+    });
+
+    const proxy = startProxy();
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    try {
+        const req = http.request({
+            hostname: 'localhost',
+            port: PROXY_PORT,
+            path: '/v1/responses',
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        req.write(JSON.stringify({
+            model: 'test-model', stream: true,
+            tools: [{ type: 'function', name: 'shell', description: 'Run a command', parameters: { type: 'object', properties: {} } }],
+            input: [{ role: 'user', content: [{ type: 'input_text', text: 'Find usages of foo' }] }]
+        }));
+        req.end();
+
+        let body = '';
+        await new Promise((resolve, reject) => {
+            req.on('response', (res) => { res.on('data', c => { body += c.toString(); }); res.on('end', resolve); });
+            req.on('error', reject);
+        });
+
+        assert.strictEqual(upstreamCallCount, 2, 'Expected proxy to make a follow-up request');
+        assert.ok(body.includes('response.output_item.added'), 'Expected output_item.added event');
+        assert.ok(body.includes('response.function_call_arguments.delta'), 'Expected arguments delta event');
+        assert.ok(body.includes('response.output_item.done'), 'Expected output_item.done event');
+        assert.ok(body.includes('"shell"'), 'Expected function call name');
+        assert.ok(body.includes('"fc_1"'), 'Expected function call id');
+
+        const lines = body.split('\n').filter(l => l.startsWith('data: '));
+        const completedLine = [...lines].reverse().find(l => {
+            try { return JSON.parse(l.slice(5)).type === 'response.completed'; } catch { return false; }
+        });
+        assert.ok(completedLine, 'Expected response.completed event');
+        const completed = JSON.parse(completedLine.slice(5));
+        const outputTypes = completed.response.output.map(i => i.type);
+        assert.ok(outputTypes.includes('message'), 'Expected message in merged output');
+        assert.ok(outputTypes.includes('function_call'), 'Expected function_call in merged output');
+    } finally {
+        proxy.kill();
+        mockUpstream.close();
+    }
+});
+
+test('Proxy should not inject follow-up when response already has a tool call', async () => {
+    let upstreamCallCount = 0;
+    const mockUpstream = await startMockUpstream((req, res) => {
+        let chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+            upstreamCallCount++;
+            res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+            res.write('data: ' + JSON.stringify({
+                type: 'response.completed',
+                response: {
+                    id: 'resp_1', object: 'response', status: 'completed', model: 'test-model',
+                    output: [{ type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'shell', arguments: '{}' }],
+                    usage: { input_tokens: 50, output_tokens: 10, total_tokens: 60 }
+                }
+            }) + '\n\n');
+            res.end();
+        });
+    });
+
+    const proxy = startProxy();
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    try {
+        const req = http.request({
+            hostname: 'localhost',
+            port: PROXY_PORT,
+            path: '/v1/responses',
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        req.write(JSON.stringify({
+            model: 'test-model', stream: true,
+            tools: [{ type: 'function', name: 'shell', description: 'Run', parameters: { type: 'object', properties: {} } }],
+            input: [{ role: 'user', content: [{ type: 'input_text', text: 'do something' }] }]
+        }));
+        req.end();
+
+        await new Promise((resolve, reject) => {
+            req.on('response', (res) => { res.on('data', () => {}); res.on('end', resolve); });
+            req.on('error', reject);
+        });
+
+        assert.strictEqual(upstreamCallCount, 1, 'Should not make follow-up when tool call already present');
+    } finally {
+        proxy.kill();
+        mockUpstream.close();
+    }
+});
+
+test('Proxy should not inject follow-up when no tools are registered', async () => {
+    let upstreamCallCount = 0;
+    const mockUpstream = await startMockUpstream((req, res) => {
+        let chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+            upstreamCallCount++;
+            res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+            res.write('data: ' + JSON.stringify({
+                type: 'response.completed',
+                response: {
+                    id: 'resp_1', object: 'response', status: 'completed', model: 'test-model',
+                    output: [
+                        { type: 'message', id: 'msg_1', role: 'assistant', status: 'completed',
+                          content: [{ type: 'output_text', text: "I'll search for the file now." }] }
+                    ],
+                    usage: { input_tokens: 50, output_tokens: 10, total_tokens: 60 }
+                }
+            }) + '\n\n');
+            res.end();
+        });
+    });
+
+    const proxy = startProxy();
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    try {
+        const req = http.request({
+            hostname: 'localhost',
+            port: PROXY_PORT,
+            path: '/v1/responses',
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        req.write(JSON.stringify({ model: 'test-model', stream: true, input: [{ role: 'user', content: 'hi' }] }));
+        req.end();
+
+        await new Promise((resolve, reject) => {
+            req.on('response', (res) => { res.on('data', () => {}); res.on('end', resolve); });
+            req.on('error', reject);
+        });
+
+        assert.strictEqual(upstreamCallCount, 1, 'Should not make follow-up when no tools registered');
+    } finally {
+        proxy.kill();
+        mockUpstream.close();
+    }
+});
+
+test('Proxy should not inject follow-up when model replies FINISHED', async () => {
+    let upstreamCallCount = 0;
+    const mockUpstream = await startMockUpstream((req, res) => {
+        let chunks = [];
+        req.on('data', chunk => chunks.push(chunk));
+        req.on('end', () => {
+            upstreamCallCount++;
+            res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+            const output = upstreamCallCount === 1
+                ? [{ type: 'message', id: 'msg_1', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: "I'll check the backlog." }] }]
+                : [{ type: 'message', id: 'msg_2', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'FINISHED' }] }];
+            res.write('data: ' + JSON.stringify({
+                type: 'response.completed',
+                response: { id: `resp_${upstreamCallCount}`, object: 'response', status: 'completed', model: 'test-model', output, usage: { input_tokens: 50, output_tokens: 5, total_tokens: 55 } }
+            }) + '\n\n');
+            res.end();
+        });
+    });
+
+    const proxy = startProxy();
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    try {
+        const req = http.request({
+            hostname: 'localhost',
+            port: PROXY_PORT,
+            path: '/v1/responses',
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        });
+        req.write(JSON.stringify({
+            model: 'test-model', stream: true,
+            tools: [{ type: 'function', name: 'shell', description: 'Run', parameters: { type: 'object', properties: {} } }],
+            input: [{ role: 'user', content: [{ type: 'input_text', text: 'are we done?' }] }]
+        }));
+        req.end();
+
+        let body = '';
+        await new Promise((resolve, reject) => {
+            req.on('response', (res) => { res.on('data', c => { body += c; }); res.on('end', resolve); });
+            req.on('error', reject);
+        });
+
+        assert.strictEqual(upstreamCallCount, 2, 'Should make follow-up when text-only');
+        const lines = body.split('\n').filter(l => l.startsWith('data: '));
+        const completedLine = [...lines].reverse().find(l => {
+            try { return JSON.parse(l.slice(5)).type === 'response.completed'; } catch { return false; }
+        });
+        assert.ok(completedLine, 'Expected response.completed');
+        const completed = JSON.parse(completedLine.slice(5));
+        assert.ok(!completed.response.output.some(i => i.type === 'function_call'), 'Should not inject FC when FINISHED');
+    } finally {
+        proxy.kill();
+        mockUpstream.close();
     }
 });
