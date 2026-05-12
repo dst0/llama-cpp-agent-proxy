@@ -471,6 +471,7 @@ const server = http.createServer((req, res) => {
                     temperature: json.temperature,
                     tools: json.tools?.map(t => t.name || t.function?.name),
                     input_count: Array.isArray(json.input) ? json.input.length : undefined,
+                    req_headers: req.headers,
                     body: sanitizeForLog(json)
                 });
 
@@ -522,6 +523,7 @@ const server = http.createServer((req, res) => {
                                     type: 'response',
                                     model: json.model,
                                     status: proxyRes.statusCode,
+                                    res_headers: proxyRes.headers,
                                     body: sanitizeForLog(resJson)
                                 });
                             } catch (e) {
@@ -531,6 +533,7 @@ const server = http.createServer((req, res) => {
                                     type: 'response_raw',
                                     model: json.model,
                                     status: proxyRes.statusCode,
+                                    res_headers: proxyRes.headers,
                                     body: sanitizeForLog(resData)
                                 });
                             }
@@ -573,6 +576,7 @@ const server = http.createServer((req, res) => {
                                 type: 'stream_end',
                                 model: json.model,
                                 status: proxyRes.statusCode,
+                                res_headers: proxyRes.headers,
                                 finish_reason: finishReason,
                                 usage,
                                 output_text: textOutput || undefined
