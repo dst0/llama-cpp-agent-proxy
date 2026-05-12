@@ -1,32 +1,55 @@
 import http from "node:http";
 import fs from "node:fs";
+import { exec } from "node:child_process";
 
 const TARGET_HOST = process.env.TARGET_HOST || '127.0.0.1';
 const TARGET_PORT = parseInt(process.env.TARGET_PORT || '11435', 10);
 const PROXY_PORT = parseInt(process.env.PORT || '11437', 10);
 const LOG_FILE = process.env.LOG_FILE || 'proxy.log';
 const FULL_LOG_FILE = process.env.FULL_LOG_FILE || 'proxy-full.log';
-const LOG_STREAM = fs.createWriteStream(LOG_FILE, { flags: 'a' });
-const FULL_LOG_STREAM = fs.createWriteStream(FULL_LOG_FILE, { flags: 'a' });
 
-LOG_STREAM.on('error', (err) => {
-    console.error(`[${new Date().toISOString()}] ERROR: Failed to write log file ${LOG_FILE}: ${err.message}`);
-});
-FULL_LOG_STREAM.on('error', (err) => {
-    console.error(`[${new Date().toISOString()}] ERROR: Failed to write full log file ${FULL_LOG_FILE}: ${err.message}`);
-});
+const MAX_LOG_SIZE = 32 * 1024 * 1024;
+const MAX_LOG_FILES = 5;
+
+function rotateLog(filePath) {
+    if (!fs.existsSync(filePath)) return;
+    try {
+        const stats = fs.statSync(filePath);
+        if (stats.size < MAX_LOG_SIZE) return;
+
+        for (let i = MAX_LOG_FILES - 1; i >= 1; i--) {
+            const oldPath = `${filePath}.${i}`;
+            const newPath = `${filePath}.${i + 1}`;
+            if (fs.existsSync(oldPath)) {
+                fs.renameSync(oldPath, newPath);
+            }
+        }
+        fs.renameSync(filePath, `${filePath}.1`);
+    } catch (e) {
+        console.error(`[${new Date().toISOString()}] Log rotation failed for ${filePath}: ${e.message}`);
+    }
+}
+
+function writeLog(filePath, line) {
+    try {
+        rotateLog(filePath);
+        fs.appendFileSync(filePath, line + "\n");
+    } catch (e) {
+        console.error(`[${new Date().toISOString()}] Failed to write to log ${filePath}: ${e.message}`);
+    }
+}
 
 function log(msg) {
     const timestamp = new Date().toISOString();
     const line = `[${timestamp}] ${msg}`;
-    LOG_STREAM.write(line + "\n");
+    writeLog(LOG_FILE, line);
     console.log(line);
 }
 
 function error(msg) {
     const timestamp = new Date().toISOString();
     const line = `[${timestamp}] ERROR: ${msg}`;
-    LOG_STREAM.write(line + "\n");
+    writeLog(LOG_FILE, line);
     console.error(line);
 }
 
@@ -57,7 +80,7 @@ function sanitizeForLog(val, depth = 0) {
 
 function logFull(entry) {
     const line = JSON.stringify({ ts: new Date().toISOString(), ...entry });
-    FULL_LOG_STREAM.write(line + '\n');
+    writeLog(FULL_LOG_FILE, line);
 }
 
 const MODEL_TEMPLATE = {
@@ -778,3 +801,47 @@ const server = http.createServer((req, res) => {
 server.listen(PROXY_PORT, "0.0.0.0", () => {
     log(`[llama-cpp-agent-proxy] Listening on 0.0.0.0:${PROXY_PORT} -> ${TARGET_HOST}:${TARGET_PORT}`);
 });
+
+function restartLlamaService(reason) {
+    log(`[Monitor] Restarting llama-server service. Reason: ${reason}`);
+    exec("sudo -n systemctl restart llama-server", (err, stdout, stderr) => {
+        if (err) {
+            error(`[Monitor] Failed to restart llama-server: ${err.message}`);
+        } else {
+            log(`[Monitor] llama-server restarted successfully.`);
+        }
+    });
+}
+
+// 1. Regular liveness ping (once a minute)
+setInterval(() => {
+    const options = {
+        hostname: TARGET_HOST,
+        port: TARGET_PORT,
+        path: '/health',
+        method: 'GET',
+        timeout: 10000
+    };
+
+    const req = http.request(options, (res) => {
+        if (res.statusCode !== 200) {
+            restartLlamaService(`Upstream /health returned status ${res.statusCode}`);
+        }
+    });
+
+    req.on('error', (err) => {
+        restartLlamaService(`Upstream /health connection error: ${err.message}`);
+    });
+
+    req.on('timeout', () => {
+        req.destroy();
+        restartLlamaService('Upstream /health timed out');
+    });
+
+    req.end();
+}, 60000);
+
+// 2. Scheduled restart (every 30 minutes)
+setInterval(() => {
+    restartLlamaService('Scheduled 30-minute restart');
+}, 30 * 60 * 1000);
