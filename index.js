@@ -37,7 +37,7 @@ const MODEL_TEMPLATE = {
     "shell_type": "shell_command",
     "visibility": "list",
     "supported_in_api": true,
-    "capabilities": ["completion", "multimodal", "vision"],
+    "capabilities": ["completion"],
     "priority": 0,
     "max_context_window": 65536,
     "base_instructions": "",
@@ -82,22 +82,43 @@ const server = http.createServer((req, res) => {
         return proxyReq;
     };
 
+    // Helper to fetch server properties dynamically
+    const getUpstreamProps = () => {
+        return new Promise((resolve) => {
+            http.get(`http://${TARGET_HOST}:${TARGET_PORT}/props`, (res) => {
+                let data = '';
+                res.on('data', c => data += c);
+                res.on('end', () => {
+                    try { resolve(JSON.parse(data)); } catch { resolve({}); }
+                });
+            }).on('error', () => resolve({})).setTimeout(500);
+        });
+    };
+
     if (isModels) {
         const proxyReq = createProxyReq();
         proxyReq.on('response', (proxyRes) => {
             let bodyChunks = [];
             proxyRes.on('data', chunk => bodyChunks.push(chunk));
-            proxyRes.on('end', () => {
+            proxyRes.on('end', async () => {
                 const data = Buffer.concat(bodyChunks).toString();
+                const props = await getUpstreamProps();
+                
                 try {
                     const json = JSON.parse(data);
                     if (Array.isArray(json.models)) {
-                        json.models = json.models.map(m => ({ 
-                            ...MODEL_TEMPLATE, 
-                            ...m,
-                            slug: m.slug || m.name || m.model || MODEL_TEMPLATE.slug,
-                            display_name: m.display_name || m.name || m.model || MODEL_TEMPLATE.display_name
-                        }));
+                        json.models = json.models.map(m => {
+                            const capabilities = ["completion"];
+                            if (props.modalities?.vision) capabilities.push("multimodal", "vision");
+                            
+                            return { 
+                                ...MODEL_TEMPLATE, 
+                                ...m,
+                                slug: m.slug || m.name || m.model || MODEL_TEMPLATE.slug,
+                                display_name: m.display_name || m.name || m.model || MODEL_TEMPLATE.display_name,
+                                capabilities: capabilities
+                            };
+                        });
                     }
                     const body = JSON.stringify(json);
                     const headers = { ...proxyRes.headers };
@@ -127,13 +148,19 @@ const server = http.createServer((req, res) => {
 
                 if (Array.isArray(json.input)) {
                     json.input = json.input.map(item => {
+                        // Normalize content parts in messages
                         if (Array.isArray(item.content)) {
                             item.content = item.content.map(part => {
                                 if (part.type === 'text') part.type = 'input_text';
-                                if (part.type === 'image_url') part.type = 'input_image';
+                                if (part.type === 'image_url') {
+                                    part.type = 'input_image';
+                                    const url = typeof part.image_url === 'object' ? part.image_url.url : part.image_url;
+                                    part.image_url = url;
+                                }
                                 return part;
                             });
                         }
+                        // Normalize tool outputs
                         if (item.type === 'function_call_output' && Array.isArray(item.output)) {
                             item.output = item.output.map(part => {
                                 if (part.type === 'text' || !part.type) part.type = 'input_text';
@@ -142,6 +169,7 @@ const server = http.createServer((req, res) => {
                         }
                         return item;
                     });
+                }
                 }
 
                 if (Array.isArray(json.tools)) {
