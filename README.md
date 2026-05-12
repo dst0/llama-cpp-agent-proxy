@@ -20,6 +20,14 @@ A high-performance, transparent compatibility bridge between **Codex** (and othe
    ```
 4. Point your client to `http://<your-ip>:11437/v1`.
 
+## Multimodal image input
+
+For image requests, use a vision-capable `llama-server` model with a matching `--mmproj`.
+If you want to load local files, set `--media-path` and keep the path slash-terminated, then send
+`input_image` parts with `image_url` values like `file://test.png`.
+
+Remote `http(s)` image URLs also work when the upstream model supports vision.
+
 ## Why is this needed?
 
 While `llama-server` is extremely fast, its implementation of the newer `/v1/responses` endpoint is stricter than standard OpenAI. This proxy handles the "surgically required" patches to make agentic workflows seamless without sacrificing the raw performance of `llama.cpp`.
