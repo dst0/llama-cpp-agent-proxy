@@ -37,6 +37,7 @@ const MODEL_TEMPLATE = {
     "shell_type": "shell_command",
     "visibility": "list",
     "supported_in_api": true,
+    "capabilities": ["completion", "multimodal", "vision"],
     "priority": 0,
     "max_context_window": 131072,
     "base_instructions": "",
