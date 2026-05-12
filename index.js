@@ -80,6 +80,29 @@ function normalizeToolOutput(output) {
     });
 }
 
+function normalizeResponseContentPart(part) {
+    if (typeof part === 'string') {
+        return { type: 'output_text', text: part };
+    }
+
+    if (!part || typeof part !== 'object') return null;
+
+    if (part.type === 'refusal') {
+        return part;
+    }
+
+    if (part.type === 'reasoning' || part.type === 'reasoning_text' || part.type === 'summary_text') {
+        return null;
+    }
+
+    if (part.type === 'output_text' || part.type === 'text' || !part.type) {
+        part.type = 'output_text';
+        return part;
+    }
+
+    return null;
+}
+
 const server = http.createServer((req, res) => {
     const isModels = req.method === 'GET' && req.url.startsWith('/v1/models');
     const isResponses = req.method === 'POST' && req.url.startsWith('/v1/responses');
@@ -248,6 +271,14 @@ const server = http.createServer((req, res) => {
                                     resJson.output.forEach(item => {
                                         if (item.type === 'reasoning' && !item.summary) {
                                             item.summary = [{ type: "summary_text", text: "Reasoning trace..." }];
+                                        }
+
+                                        if (Array.isArray(item.content)) {
+                                            item.content = item.content
+                                                .map(normalizeResponseContentPart)
+                                                .filter(Boolean);
+                                        } else if (typeof item.content === 'string') {
+                                            item.content = [{ type: 'output_text', text: item.content }];
                                         }
                                     });
                                     resJson.output = resJson.output.filter(item => item.type !== 'reasoning');

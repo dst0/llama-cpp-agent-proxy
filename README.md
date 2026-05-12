@@ -6,6 +6,7 @@ A high-performance, transparent compatibility bridge between **Codex** (and othe
 
 - **Transparent Mirroring**: Directly pipes all traffic by default, supporting **Streaming (SSE)** perfectly.
 - **Agentic Tool Flattening**: Automatically converts nested OpenAI function definitions into the flat format required by `llama-server`'s `/v1/responses` endpoint.
+- **Response Content Normalization**: Rewrites assistant message content into OpenAI-friendly `output_text` / `refusal` parts and strips unsupported reasoning content.
 - **Exhaustive Metadata Patching**: Injects mandatory contract fields (`slug`, `display_name`, `supported_reasoning_levels`, etc.) to satisfy strict client-side model managers.
 - **Reasoning Level Support**: Advertises and maps reasoning levels (Minimal, Low, Medium, High, Extra High) for local models.
 - **Network Ready**: Binds to `0.0.0.0` for full LAN accessibility.
