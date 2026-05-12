@@ -277,7 +277,7 @@ function normalizeInputItem(item) {
     return item;
 }
 
-function createSseNormalizer(proxyRes, res, { onEvent } = {}) {
+function createSseNormalizer(proxyRes, res, { onRawEvent, onNormalizedEvent } = {}) {
     let buffer = '';
 
     proxyRes.setEncoding('utf8');
@@ -297,8 +297,10 @@ function createSseNormalizer(proxyRes, res, { onEvent } = {}) {
 
                 try {
                     const parsed = JSON.parse(payload);
-                    if (onEvent) onEvent(parsed);
-                    return `data: ${JSON.stringify(normalizeResponseJson(parsed))}`;
+                    if (onRawEvent) onRawEvent(parsed);
+                    const normalized = normalizeResponseJson(parsed);
+                    if (onNormalizedEvent) onNormalizedEvent(normalized);
+                    return `data: ${JSON.stringify(normalized)}`;
                 } catch {
                     return line;
                 }
@@ -542,31 +544,24 @@ const server = http.createServer((req, res) => {
                         log(`[Proxy] Streaming started for ${json.model}`);
                         res.writeHead(proxyRes.statusCode, proxyRes.headers);
 
-                        let textOutput = '';
                         let finishReason = null;
                         let usage = null;
 
                         createSseNormalizer(proxyRes, res, {
-                            onEvent(parsed) {
-                                // Accumulate text deltas
-                                const delta = parsed.choices?.[0]?.delta;
-                                if (delta?.content) textOutput += delta.content;
-                                if (delta?.reasoning_content) textOutput += delta.reasoning_content;
+                            onRawEvent(parsed) {
+                                logFull({ type: 'sse_upstream', model: json.model, event: parsed });
 
-                                // Capture finish metadata
                                 if (parsed.choices?.[0]?.finish_reason) {
                                     finishReason = parsed.choices[0].finish_reason;
                                 }
                                 if (parsed.usage) usage = parsed.usage;
-
-                                // Also handle responses API event format
                                 if (parsed.type === 'response.completed' && parsed.response) {
                                     finishReason = parsed.response.status;
                                     usage = parsed.response.usage;
                                 }
-                                if (parsed.type === 'response.output_text.done') {
-                                    textOutput = parsed.text ?? textOutput;
-                                }
+                            },
+                            onNormalizedEvent(normalized) {
+                                logFull({ type: 'sse_proxy', model: json.model, event: normalized });
                             }
                         });
 
@@ -578,8 +573,7 @@ const server = http.createServer((req, res) => {
                                 status: proxyRes.statusCode,
                                 res_headers: proxyRes.headers,
                                 finish_reason: finishReason,
-                                usage,
-                                output_text: textOutput || undefined
+                                usage
                             });
                         });
                     }
