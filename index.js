@@ -67,7 +67,7 @@ function normalizeContentPart(part, role = 'user') {
         } else {
             return null;
         }
-    } else if (part.type === 'text' || part.type === 'output_text' || part.type === 'input_text' || !part.type) {
+    } else if (part.type === 'text' || part.type === 'output_text' || !part.type) {
         part.type = 'input_text';
     } else if (part.type === 'reasoning' || part.type === 'reasoning_text' || part.type === 'summary_text') {
         return null;
@@ -135,10 +135,6 @@ function normalizeResponseItem(item) {
             .filter(Boolean);
     } else if (typeof item.content === 'string') {
         item.content = [{ type: 'output_text', text: item.content }];
-    }
-
-    if (item.type === 'message' && item.role === 'assistant' && Array.isArray(item.content) && item.content.length === 0) {
-        return null;
     }
 
     return item;
