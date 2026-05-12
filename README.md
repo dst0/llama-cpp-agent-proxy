@@ -20,6 +20,22 @@ A high-performance, transparent compatibility bridge between **Codex** (and othe
    ```
 4. Point your client to `http://<your-ip>:11437/v1`.
 
+## Run as a service
+
+Use the installer to register the proxy as a user service on macOS (LaunchAgent) or Ubuntu/Linux (systemd user):
+
+```bash
+bash scripts/install-service.sh
+```
+
+You can override the defaults with `TARGET_HOST`, `TARGET_PORT`, `PORT`, or `--service-name`.
+
+To remove the service again:
+
+```bash
+bash scripts/uninstall-service.sh
+```
+
 ## Multimodal image input
 
 For image requests, use a vision-capable `llama-server` model with a matching `--mmproj`.

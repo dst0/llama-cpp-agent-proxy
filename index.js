@@ -49,14 +49,14 @@ const MODEL_TEMPLATE = {
 function normalizeContentPart(part) {
     if (!part || typeof part !== 'object') return part;
 
-    if (part.type === 'text' || part.type === 'output_text' || !part.type) {
-        part.type = 'input_text';
-    }
-
-    if (part.type === 'image_url' || (part.type === 'image' && part.image_url)) {
+    const imageUrl = typeof part.image_url === 'object' ? part.image_url?.url : part.image_url;
+    if (part.type === 'image_url' || part.type === 'input_image' || (part.type === 'image' && part.image_url !== undefined) || part.image_url !== undefined) {
         part.type = 'input_image';
-        const url = typeof part.image_url === 'object' ? part.image_url.url : part.image_url;
-        part.image_url = url;
+        if (typeof imageUrl === 'string') {
+            part.image_url = imageUrl;
+        }
+    } else if (part.type === 'text' || part.type === 'output_text' || !part.type) {
+        part.type = 'input_text';
     }
 
     return part;
@@ -250,6 +250,7 @@ const server = http.createServer((req, res) => {
                                             item.summary = [{ type: "summary_text", text: "Reasoning trace..." }];
                                         }
                                     });
+                                    resJson.output = resJson.output.filter(item => item.type !== 'reasoning');
                                 }
                                 const finalBody = JSON.stringify(resJson);
                                 const headers = { ...proxyRes.headers };

@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node index.js",
+    "install:service": "bash scripts/install-service.sh",
+    "uninstall:service": "bash scripts/uninstall-service.sh",
     "test": "node --test test/*.test.js"
   },
   "keywords": ["llama.cpp", "proxy", "openai", "agentic", "tool-calling"],
