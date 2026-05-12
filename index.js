@@ -657,6 +657,7 @@ const server = http.createServer((req, res) => {
 
                         let finishReason = null;
                         let usage = null;
+                        let textOutput = '';
 
                         createSseNormalizer(proxyRes, res, {
                             onRawEvent(parsed) {
@@ -673,14 +674,33 @@ const server = http.createServer((req, res) => {
                             },
                             onNormalizedEvent(normalized) {
                                 logFull({ type: 'sse_proxy', model: json.model, event: normalized });
+
+                                if (normalized.type === 'response.output_text.delta' && typeof normalized.delta === 'string') {
+                                    textOutput += normalized.delta;
+                                }
+
+                                if (normalized.type === 'response.output_text.done' && typeof normalized.text === 'string') {
+                                    textOutput = normalized.text;
+                                }
+
+                                if (normalized.type === 'response.output_item.done') {
+                                    const item = normalized.item;
+                                    const itemText = item?.content?.find?.(c => c.type === 'output_text')?.text;
+                                    if (typeof itemText === 'string' && itemText) {
+                                        textOutput = itemText;
+                                    }
+                                }
                             },
                             async onCompleted(completedEvent) {
                                 const output = completedEvent.response?.output ?? [];
                                 const hasFunctionCall = output.some(i => i.type === 'function_call');
-                                const textContent = output
+                                const completedText = output
                                     .find(i => i.type === 'message')
-                                    ?.content?.find(c => c.type === 'output_text')?.text ?? '';
+                                    ?.content?.find(c => c.type === 'output_text')?.text;
+                                const textContent = textOutput || completedText || '';
                                 const hasTools = Array.isArray(json.tools) && json.tools.length > 0;
+
+                                log(`[Proxy] Completed gate for ${json.model}: tools=${hasTools} function_call=${hasFunctionCall} text=${Boolean(textContent)}`);
 
                                 let mergedOutput = output;
 
