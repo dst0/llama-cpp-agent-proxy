@@ -67,7 +67,7 @@ function normalizeContentPart(part, role = 'user') {
         } else {
             return null;
         }
-    } else if (part.type === 'text' || part.type === 'output_text' || !part.type) {
+    } else if (part.type === 'text' || part.type === 'output_text' || part.type === 'input_text' || !part.type) {
         part.type = 'input_text';
     } else if (part.type === 'reasoning' || part.type === 'reasoning_text' || part.type === 'summary_text') {
         return null;
