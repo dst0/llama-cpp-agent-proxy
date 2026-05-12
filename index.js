@@ -4,19 +4,24 @@ import fs from "node:fs";
 const TARGET_HOST = process.env.TARGET_HOST || '127.0.0.1';
 const TARGET_PORT = parseInt(process.env.TARGET_PORT || '11435', 10);
 const PROXY_PORT = parseInt(process.env.PORT || '11437', 10);
-const LOG_FILE = "proxy.log";
+const LOG_FILE = process.env.LOG_FILE || 'proxy.log';
+const LOG_STREAM = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+
+LOG_STREAM.on('error', (err) => {
+    console.error(`[${new Date().toISOString()}] ERROR: Failed to write log file ${LOG_FILE}: ${err.message}`);
+});
 
 function log(msg) {
     const timestamp = new Date().toISOString();
     const line = `[${timestamp}] ${msg}`;
-    fs.appendFileSync(LOG_FILE, line + "\n");
+    LOG_STREAM.write(line + "\n");
     console.log(line);
 }
 
 function error(msg) {
     const timestamp = new Date().toISOString();
     const line = `[${timestamp}] ERROR: ${msg}`;
-    fs.appendFileSync(LOG_FILE, line + "\n");
+    LOG_STREAM.write(line + "\n");
     console.error(line);
 }
 
@@ -51,6 +56,7 @@ function normalizeContentPart(part, role = 'user') {
 
     const imageUrl = typeof part.image_url === 'object' ? part.image_url?.url : part.image_url;
     const isAssistant = role === 'assistant';
+    const isTextPart = part.type === 'text' || part.type === 'input_text' || part.type === 'output_text' || !part.type;
 
     if (part.type === 'image_url' || part.type === 'input_image' || (part.type === 'image' && part.image_url !== undefined) || part.image_url !== undefined) {
         part.type = 'input_image';
@@ -60,14 +66,14 @@ function normalizeContentPart(part, role = 'user') {
     } else if (part.type === 'refusal') {
         return part;
     } else if (isAssistant) {
-        if (part.type === 'text' || part.type === 'output_text' || !part.type) {
+        if (isTextPart) {
             part.type = 'output_text';
         } else if (part.type === 'reasoning' || part.type === 'reasoning_text' || part.type === 'summary_text') {
             return null;
         } else {
             return null;
         }
-    } else if (part.type === 'text' || part.type === 'output_text' || !part.type) {
+    } else if (isTextPart) {
         part.type = 'input_text';
     } else if (part.type === 'reasoning' || part.type === 'reasoning_text' || part.type === 'summary_text') {
         return null;
@@ -93,7 +99,7 @@ function normalizeToolOutput(output) {
         }
 
         return normalizeContentPart(part);
-    });
+    }).filter(Boolean);
 }
 
 function normalizeResponseContentPart(part) {
@@ -156,6 +162,54 @@ function normalizeResponseJson(resJson) {
     }
 
     return resJson;
+}
+
+function normalizeInputItem(item) {
+    if (!item || typeof item !== 'object') return item;
+
+    if (item.role === 'tool' && item.type !== 'function_call_output') {
+        item.type = 'function_call_output';
+        if (!item.call_id && item.tool_call_id) item.call_id = item.tool_call_id;
+        if (item.output === undefined && item.content !== undefined) {
+            item.output = item.content;
+            delete item.content;
+        }
+        delete item.role;
+        delete item.tool_call_id;
+    } else if (item.type !== 'function_call_output' && item.type !== 'function_call') {
+        item.type = 'message';
+        if (!item.role) item.role = 'assistant';
+    }
+
+    if (item.type === 'function_call_output') {
+        if (item.output === undefined && item.content !== undefined) {
+            item.output = item.content;
+            delete item.content;
+        }
+        item.output = normalizeToolOutput(item.output);
+        return item;
+    }
+
+    if (item.type !== 'message') {
+        return item;
+    }
+
+    if (Array.isArray(item.content)) {
+        item.content = item.content
+            .map(part => normalizeContentPart(part, item.role))
+            .filter(Boolean);
+    } else if (typeof item.content === 'string') {
+        item.content = [{
+            type: item.role === 'assistant' ? 'output_text' : 'input_text',
+            text: item.content
+        }];
+    }
+
+    if (item.role === 'assistant' && Array.isArray(item.content) && item.content.length === 0) {
+        return null;
+    }
+
+    return item;
 }
 
 function createSseNormalizer(proxyRes, res) {
@@ -235,13 +289,31 @@ const server = http.createServer((req, res) => {
     // Helper to fetch server properties dynamically
     const getUpstreamProps = () => {
         return new Promise((resolve) => {
-            http.get(`http://${TARGET_HOST}:${TARGET_PORT}/props`, (res) => {
+            let settled = false;
+            const finish = (value = {}) => {
+                if (settled) return;
+                settled = true;
+                resolve(value);
+            };
+
+            const propsReq = http.get(`http://${TARGET_HOST}:${TARGET_PORT}/props`, (propsRes) => {
                 let data = '';
-                res.on('data', c => data += c);
-                res.on('end', () => {
-                    try { resolve(JSON.parse(data)); } catch { resolve({}); }
+                propsRes.on('data', c => data += c);
+                propsRes.on('end', () => {
+                    try {
+                        finish(JSON.parse(data));
+                    } catch {
+                        finish({});
+                    }
                 });
-            }).on('error', () => resolve({})).setTimeout(500);
+                propsRes.on('error', () => finish({}));
+            });
+
+            propsReq.on('error', () => finish({}));
+            propsReq.setTimeout(500, () => {
+                propsReq.destroy(new Error('Upstream props request timed out'));
+                finish({});
+            });
         });
     };
 
@@ -298,41 +370,8 @@ const server = http.createServer((req, res) => {
 
                 if (Array.isArray(json.input)) {
                     json.input = json.input.map(item => {
-                        if (item.role === 'tool' && item.type !== 'function_call_output') {
-                            item.type = 'function_call_output';
-                            if (!item.call_id && item.tool_call_id) item.call_id = item.tool_call_id;
-                            if (item.output === undefined && item.content !== undefined) {
-                                item.output = item.content;
-                                delete item.content;
-                            }
-                            delete item.role;
-                            delete item.tool_call_id;
-                        } else if (item.type !== 'function_call_output') {
-                            item.type = 'message';
-                            if (!item.role) item.role = 'assistant';
-                        }
-
-                        log(`[Proxy] Debug: Processing item: ${JSON.stringify(item)}`);
-
-                        if (item.type === 'function_call_output') {
-                            if (item.output === undefined && item.content !== undefined) {
-                                item.output = item.content;
-                                delete item.content;
-                            }
-                            item.output = normalizeToolOutput(item.output);
-                        } else if (Array.isArray(item.content)) {
-                            item.content = item.content
-                                .map(part => normalizeContentPart(part, item.role))
-                                .filter(Boolean);
-                        } else if (typeof item.content === 'string') {
-                            item.content = [{
-                                type: item.role === 'assistant' ? 'output_text' : 'input_text',
-                                text: item.content
-                            }];
-                        }
-
-                        return item;
-                    });
+                        return normalizeInputItem(item);
+                    }).filter(Boolean);
                 }
 
                 if (Array.isArray(json.tools)) {
