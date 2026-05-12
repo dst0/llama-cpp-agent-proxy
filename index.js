@@ -5,10 +5,15 @@ const TARGET_HOST = process.env.TARGET_HOST || '127.0.0.1';
 const TARGET_PORT = parseInt(process.env.TARGET_PORT || '11435', 10);
 const PROXY_PORT = parseInt(process.env.PORT || '11437', 10);
 const LOG_FILE = process.env.LOG_FILE || 'proxy.log';
+const FULL_LOG_FILE = process.env.FULL_LOG_FILE || 'proxy-full.log';
 const LOG_STREAM = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+const FULL_LOG_STREAM = fs.createWriteStream(FULL_LOG_FILE, { flags: 'a' });
 
 LOG_STREAM.on('error', (err) => {
     console.error(`[${new Date().toISOString()}] ERROR: Failed to write log file ${LOG_FILE}: ${err.message}`);
+});
+FULL_LOG_STREAM.on('error', (err) => {
+    console.error(`[${new Date().toISOString()}] ERROR: Failed to write full log file ${FULL_LOG_FILE}: ${err.message}`);
 });
 
 function log(msg) {
@@ -23,6 +28,36 @@ function error(msg) {
     const line = `[${timestamp}] ERROR: ${msg}`;
     LOG_STREAM.write(line + "\n");
     console.error(line);
+}
+
+// Sanitize values for logging: replace base64 blobs and truncate long strings.
+function sanitizeForLog(val, depth = 0) {
+    if (depth > 10) return '[...]';
+    if (typeof val === 'string') {
+        if (val.startsWith('data:') && val.includes(';base64,')) {
+            const prefix = val.slice(0, val.indexOf(';base64,') + 8);
+            return `${prefix}[base64 ~${Math.round((val.length - prefix.length) * 3 / 4)} bytes]`;
+        }
+        if (val.length > 200 && /^[A-Za-z0-9+/]{100,}={0,2}$/.test(val)) {
+            return `[base64 ~${Math.round(val.length * 3 / 4)} bytes]`;
+        }
+        if (val.length > 2000) {
+            return val.slice(0, 1000) + ` ...[+${val.length - 1000} chars]`;
+        }
+        return val;
+    }
+    if (Array.isArray(val)) return val.map(v => sanitizeForLog(v, depth + 1));
+    if (val && typeof val === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(val)) out[k] = sanitizeForLog(v, depth + 1);
+        return out;
+    }
+    return val;
+}
+
+function logFull(entry) {
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...entry });
+    FULL_LOG_STREAM.write(line + '\n');
 }
 
 const MODEL_TEMPLATE = {
@@ -242,7 +277,7 @@ function normalizeInputItem(item) {
     return item;
 }
 
-function createSseNormalizer(proxyRes, res) {
+function createSseNormalizer(proxyRes, res, { onEvent } = {}) {
     let buffer = '';
 
     proxyRes.setEncoding('utf8');
@@ -262,6 +297,7 @@ function createSseNormalizer(proxyRes, res) {
 
                 try {
                     const parsed = JSON.parse(payload);
+                    if (onEvent) onEvent(parsed);
                     return `data: ${JSON.stringify(normalizeResponseJson(parsed))}`;
                 } catch {
                     return line;
@@ -426,6 +462,17 @@ const server = http.createServer((req, res) => {
                 const json = JSON.parse(body);
                 const targetPort = getTargetPortForModel(json.model);
                 log(`[Proxy] Request: ${json.model} (stream=${!!json.stream}) -> port ${targetPort}`);
+                logFull({
+                    type: 'request',
+                    model: json.model,
+                    stream: !!json.stream,
+                    target_port: targetPort,
+                    max_output_tokens: json.max_output_tokens,
+                    temperature: json.temperature,
+                    tools: json.tools?.map(t => t.name || t.function?.name),
+                    input_count: Array.isArray(json.input) ? json.input.length : undefined,
+                    body: sanitizeForLog(json)
+                });
 
                 if (Array.isArray(json.input)) {
                     json.input = json.input.flatMap(item => {
@@ -471,16 +518,66 @@ const server = http.createServer((req, res) => {
                                 headers['content-length'] = Buffer.byteLength(finalBody);
                                 res.writeHead(proxyRes.statusCode, headers);
                                 res.end(finalBody);
+                                logFull({
+                                    type: 'response',
+                                    model: json.model,
+                                    status: proxyRes.statusCode,
+                                    body: sanitizeForLog(resJson)
+                                });
                             } catch (e) {
                                 res.writeHead(proxyRes.statusCode, proxyRes.headers);
                                 res.end(resData);
+                                logFull({
+                                    type: 'response_raw',
+                                    model: json.model,
+                                    status: proxyRes.statusCode,
+                                    body: sanitizeForLog(resData)
+                                });
                             }
                         });
                     } else {
                         log(`[Proxy] Streaming started for ${json.model}`);
                         res.writeHead(proxyRes.statusCode, proxyRes.headers);
-                        createSseNormalizer(proxyRes, res);
-                        proxyRes.on('end', () => log(`[Proxy] Streaming finished for ${json.model}`));
+
+                        let textOutput = '';
+                        let finishReason = null;
+                        let usage = null;
+
+                        createSseNormalizer(proxyRes, res, {
+                            onEvent(parsed) {
+                                // Accumulate text deltas
+                                const delta = parsed.choices?.[0]?.delta;
+                                if (delta?.content) textOutput += delta.content;
+                                if (delta?.reasoning_content) textOutput += delta.reasoning_content;
+
+                                // Capture finish metadata
+                                if (parsed.choices?.[0]?.finish_reason) {
+                                    finishReason = parsed.choices[0].finish_reason;
+                                }
+                                if (parsed.usage) usage = parsed.usage;
+
+                                // Also handle responses API event format
+                                if (parsed.type === 'response.completed' && parsed.response) {
+                                    finishReason = parsed.response.status;
+                                    usage = parsed.response.usage;
+                                }
+                                if (parsed.type === 'response.output_text.done') {
+                                    textOutput = parsed.text ?? textOutput;
+                                }
+                            }
+                        });
+
+                        proxyRes.on('end', () => {
+                            log(`[Proxy] Streaming finished for ${json.model}`);
+                            logFull({
+                                type: 'stream_end',
+                                model: json.model,
+                                status: proxyRes.statusCode,
+                                finish_reason: finishReason,
+                                usage,
+                                output_text: textOutput || undefined
+                            });
+                        });
                     }
                 });
                 proxyReq.write(patchedBody);
