@@ -46,17 +46,33 @@ const MODEL_TEMPLATE = {
     "service_tiers": [{ "id": "priority", "name": "Fast", "description": "Local priority" }]
 };
 
-function normalizeContentPart(part) {
+function normalizeContentPart(part, role = 'user') {
     if (!part || typeof part !== 'object') return part;
 
     const imageUrl = typeof part.image_url === 'object' ? part.image_url?.url : part.image_url;
+    const isAssistant = role === 'assistant';
+
     if (part.type === 'image_url' || part.type === 'input_image' || (part.type === 'image' && part.image_url !== undefined) || part.image_url !== undefined) {
         part.type = 'input_image';
         if (typeof imageUrl === 'string') {
             part.image_url = imageUrl;
         }
+    } else if (part.type === 'refusal') {
+        return part;
+    } else if (isAssistant) {
+        if (part.type === 'text' || part.type === 'output_text' || !part.type) {
+            part.type = 'output_text';
+        } else if (part.type === 'reasoning' || part.type === 'reasoning_text' || part.type === 'summary_text') {
+            return null;
+        } else {
+            return null;
+        }
     } else if (part.type === 'text' || part.type === 'output_text' || !part.type) {
         part.type = 'input_text';
+    } else if (part.type === 'reasoning' || part.type === 'reasoning_text' || part.type === 'summary_text') {
+        return null;
+    } else {
+        return null;
     }
 
     return part;
@@ -101,6 +117,83 @@ function normalizeResponseContentPart(part) {
     }
 
     return null;
+}
+
+function normalizeResponseItem(item) {
+    if (!item || typeof item !== 'object') return item;
+
+    if (item.type === 'reasoning') {
+        if (!item.summary) {
+            item.summary = [{ type: 'summary_text', text: 'Reasoning trace...' }];
+        }
+        return null;
+    }
+
+    if (Array.isArray(item.content)) {
+        item.content = item.content
+            .map(part => normalizeResponseContentPart(part))
+            .filter(Boolean);
+    } else if (typeof item.content === 'string') {
+        item.content = [{ type: 'output_text', text: item.content }];
+    }
+
+    return item;
+}
+
+function normalizeResponseJson(resJson) {
+    if (Array.isArray(resJson.output)) {
+        resJson.output = resJson.output
+            .map(item => normalizeResponseItem(item))
+            .filter(Boolean);
+    }
+
+    if (Array.isArray(resJson.content)) {
+        resJson.content = resJson.content
+            .map(part => normalizeResponseContentPart(part))
+            .filter(Boolean);
+    } else if (typeof resJson.content === 'string') {
+        resJson.content = [{ type: 'output_text', text: resJson.content }];
+    }
+
+    return resJson;
+}
+
+function createSseNormalizer(proxyRes, res) {
+    let buffer = '';
+
+    proxyRes.setEncoding('utf8');
+    proxyRes.on('data', chunk => {
+        buffer += chunk;
+
+        let boundaryIndex;
+        while ((boundaryIndex = buffer.indexOf('\n\n')) !== -1) {
+            const rawEvent = buffer.slice(0, boundaryIndex);
+            buffer = buffer.slice(boundaryIndex + 2);
+
+            const normalizedEvent = rawEvent.split('\n').map(line => {
+                if (!line.startsWith('data:')) return line;
+
+                const payload = line.slice(5).trimStart();
+                if (!payload || payload === '[DONE]') return line;
+
+                try {
+                    const parsed = JSON.parse(payload);
+                    return `data: ${JSON.stringify(normalizeResponseJson(parsed))}`;
+                } catch {
+                    return line;
+                }
+            }).join('\n');
+
+            res.write(normalizedEvent + '\n\n');
+        }
+    });
+
+    proxyRes.on('end', () => {
+        if (buffer) {
+            res.write(buffer);
+        }
+        res.end();
+    });
 }
 
 const server = http.createServer((req, res) => {
@@ -228,9 +321,14 @@ const server = http.createServer((req, res) => {
                             }
                             item.output = normalizeToolOutput(item.output);
                         } else if (Array.isArray(item.content)) {
-                            item.content = item.content.map(normalizeContentPart);
+                            item.content = item.content
+                                .map(part => normalizeContentPart(part, item.role))
+                                .filter(Boolean);
                         } else if (typeof item.content === 'string') {
-                            item.content = [{ type: 'input_text', text: item.content }];
+                            item.content = [{
+                                type: item.role === 'assistant' ? 'output_text' : 'input_text',
+                                text: item.content
+                            }];
                         }
 
                         return item;
@@ -266,23 +364,7 @@ const server = http.createServer((req, res) => {
                         proxyRes.on('end', () => {
                             const resData = Buffer.concat(resChunks).toString();
                             try {
-                                const resJson = JSON.parse(resData);
-                                if (Array.isArray(resJson.output)) {
-                                    resJson.output.forEach(item => {
-                                        if (item.type === 'reasoning' && !item.summary) {
-                                            item.summary = [{ type: "summary_text", text: "Reasoning trace..." }];
-                                        }
-
-                                        if (Array.isArray(item.content)) {
-                                            item.content = item.content
-                                                .map(normalizeResponseContentPart)
-                                                .filter(Boolean);
-                                        } else if (typeof item.content === 'string') {
-                                            item.content = [{ type: 'output_text', text: item.content }];
-                                        }
-                                    });
-                                    resJson.output = resJson.output.filter(item => item.type !== 'reasoning');
-                                }
+                                const resJson = normalizeResponseJson(JSON.parse(resData));
                                 const finalBody = JSON.stringify(resJson);
                                 const headers = { ...proxyRes.headers };
                                 delete headers['content-length'];
@@ -298,7 +380,7 @@ const server = http.createServer((req, res) => {
                     } else {
                         log(`[Proxy] Streaming started for ${json.model}`);
                         res.writeHead(proxyRes.statusCode, proxyRes.headers);
-                        proxyRes.pipe(res);
+                        createSseNormalizer(proxyRes, res);
                         proxyRes.on('end', () => log(`[Proxy] Streaming finished for ${json.model}`));
                     }
                 });
