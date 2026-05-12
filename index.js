@@ -137,10 +137,6 @@ function normalizeResponseItem(item) {
         item.content = [{ type: 'output_text', text: item.content }];
     }
 
-    if (item.type === 'message' && item.role === 'assistant' && Array.isArray(item.content) && item.content.length === 0) {
-        return null;
-    }
-
     return item;
 }
 
