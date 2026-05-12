@@ -1,15 +1,25 @@
 import http from "node:http";
-
-/**
- * llama-cpp-agent-proxy
- * A transparent compatibility bridge between OpenAI Responses API clients and llama-server.
- */
+import fs from "node:fs";
 
 const TARGET_HOST = process.env.TARGET_HOST || '127.0.0.1';
 const TARGET_PORT = parseInt(process.env.TARGET_PORT || '11435', 10);
 const PROXY_PORT = parseInt(process.env.PORT || '11437', 10);
+const LOG_FILE = "proxy.log";
 
-// A robust "Base Template" for model metadata to ensure all required fields are present for clients.
+function log(msg) {
+    const timestamp = new Date().toISOString();
+    const line = `[${timestamp}] ${msg}`;
+    fs.appendFileSync(LOG_FILE, line + "\n");
+    console.log(line);
+}
+
+function error(msg) {
+    const timestamp = new Date().toISOString();
+    const line = `[${timestamp}] ERROR: ${msg}`;
+    fs.appendFileSync(LOG_FILE, line + "\n");
+    console.error(line);
+}
+
 const MODEL_TEMPLATE = {
     "slug": "local-model",
     "display_name": "Local Model",
@@ -36,28 +46,48 @@ const MODEL_TEMPLATE = {
 };
 
 const server = http.createServer((req, res) => {
-    const proxyReq = http.request({
-        hostname: TARGET_HOST,
-        port: TARGET_PORT,
-        path: req.url,
-        method: req.method,
-        headers: { ...req.headers, host: `${TARGET_HOST}:${TARGET_PORT}` }
-    });
+    const isModels = req.method === 'GET' && req.url.startsWith('/v1/models');
+    const isResponses = req.method === 'POST' && req.url.startsWith('/v1/responses');
 
-    proxyReq.on('error', (err) => {
-        console.error(`[Proxy] Upstream Error: ${err.message}`);
-        if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: "Upstream server unavailable" }));
-        }
-    });
+    const createProxyReq = (options = {}) => {
+        const cleanHeaders = { ...req.headers };
+        delete cleanHeaders['host'];
+        delete cleanHeaders['content-length'];
+        delete cleanHeaders['transfer-encoding'];
+        delete cleanHeaders['connection'];
 
-    // --- INTERCEPTOR: GET /v1/models ---
-    if (req.method === 'GET' && req.url.startsWith('/v1/models')) {
+        const proxyReq = http.request({
+            hostname: TARGET_HOST,
+            port: TARGET_PORT,
+            path: req.url,
+            method: req.method,
+            headers: { 
+                ...cleanHeaders, 
+                'host': `${TARGET_HOST}:${TARGET_PORT}`,
+                'connection': 'keep-alive'
+            },
+            ...options
+        });
+        
+        proxyReq.on('error', (err) => {
+            error(`Upstream Error (${req.method} ${req.url}): ${err.message}`);
+            if (!res.headersSent) {
+                res.writeHead(502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: "Upstream server unavailable", details: err.message }));
+            }
+        });
+
+        proxyReq.setTimeout(0);
+        return proxyReq;
+    };
+
+    if (isModels) {
+        const proxyReq = createProxyReq();
         proxyReq.on('response', (proxyRes) => {
-            let data = '';
-            proxyRes.on('data', chunk => data += chunk);
+            let bodyChunks = [];
+            proxyRes.on('data', chunk => bodyChunks.push(chunk));
             proxyRes.on('end', () => {
+                const data = Buffer.concat(bodyChunks).toString();
                 try {
                     const json = JSON.parse(data);
                     if (Array.isArray(json.models)) {
@@ -69,7 +99,10 @@ const server = http.createServer((req, res) => {
                         }));
                     }
                     const body = JSON.stringify(json);
-                    const headers = { ...proxyRes.headers, 'content-length': Buffer.byteLength(body) };
+                    const headers = { ...proxyRes.headers };
+                    delete headers['content-length'];
+                    delete headers['transfer-encoding'];
+                    headers['content-length'] = Buffer.byteLength(body);
                     res.writeHead(proxyRes.statusCode, headers);
                     res.end(body);
                 } catch (e) {
@@ -82,18 +115,17 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // --- INTERCEPTOR: POST /v1/responses ---
-    if (req.method === 'POST' && req.url.startsWith('/v1/responses')) {
-        let body = '';
-        req.on('data', chunk => body += chunk);
+    if (isResponses) {
+        let bodyChunks = [];
+        req.on('data', chunk => bodyChunks.push(chunk));
         req.on('end', () => {
+            const body = Buffer.concat(bodyChunks).toString();
             try {
                 const json = JSON.parse(body);
+                log(`[Proxy] Request: ${json.model} (stream=${!!json.stream})`);
 
-                // 1. Normalize 'input' array items (Pedantic requirement by llama-server)
                 if (Array.isArray(json.input)) {
                     json.input = json.input.map(item => {
-                        // Normalize content parts in messages
                         if (Array.isArray(item.content)) {
                             item.content = item.content.map(part => {
                                 if (part.type === 'text') part.type = 'input_text';
@@ -101,7 +133,6 @@ const server = http.createServer((req, res) => {
                                 return part;
                             });
                         }
-                        // Normalize tool outputs
                         if (item.type === 'function_call_output' && Array.isArray(item.output)) {
                             item.output = item.output.map(part => {
                                 if (part.type === 'text' || !part.type) part.type = 'input_text';
@@ -112,7 +143,6 @@ const server = http.createServer((req, res) => {
                     });
                 }
 
-                // 2. Patch tools array (Flattening)
                 if (Array.isArray(json.tools)) {
                     json.tools = json.tools.filter(t => {
                         if (t.type === 'function' || t.function) {
@@ -132,13 +162,15 @@ const server = http.createServer((req, res) => {
                 }
                 
                 const patchedBody = JSON.stringify(json);
+                const proxyReq = createProxyReq();
                 proxyReq.setHeader('content-length', Buffer.byteLength(patchedBody));
                 
                 proxyReq.on('response', (proxyRes) => {
                     if (!json.stream) {
-                        let resData = '';
-                        proxyRes.on('data', chunk => resData += chunk);
+                        let resChunks = [];
+                        proxyRes.on('data', chunk => resChunks.push(chunk));
                         proxyRes.on('end', () => {
+                            const resData = Buffer.concat(resChunks).toString();
                             try {
                                 const resJson = JSON.parse(resData);
                                 if (Array.isArray(resJson.output)) {
@@ -149,8 +181,11 @@ const server = http.createServer((req, res) => {
                                     });
                                 }
                                 const finalBody = JSON.stringify(resJson);
-                                const finalHeaders = { ...proxyRes.headers, 'content-length': Buffer.byteLength(finalBody) };
-                                res.writeHead(proxyRes.statusCode, finalHeaders);
+                                const headers = { ...proxyRes.headers };
+                                delete headers['content-length'];
+                                delete headers['transfer-encoding'];
+                                headers['content-length'] = Buffer.byteLength(finalBody);
+                                res.writeHead(proxyRes.statusCode, headers);
                                 res.end(finalBody);
                             } catch (e) {
                                 res.writeHead(proxyRes.statusCode, proxyRes.headers);
@@ -158,13 +193,17 @@ const server = http.createServer((req, res) => {
                             }
                         });
                     } else {
+                        log(`[Proxy] Streaming started for ${json.model}`);
                         res.writeHead(proxyRes.statusCode, proxyRes.headers);
                         proxyRes.pipe(res);
+                        proxyRes.on('end', () => log(`[Proxy] Streaming finished for ${json.model}`));
                     }
                 });
                 proxyReq.write(patchedBody);
                 proxyReq.end();
             } catch (e) {
+                log(`[Proxy] Failed to patch request, falling back: ${e.message}`);
+                const proxyReq = createProxyReq();
                 proxyReq.on('response', (proxyRes) => {
                     res.writeHead(proxyRes.statusCode, proxyRes.headers);
                     proxyRes.pipe(res);
@@ -176,7 +215,7 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // --- DEFAULT: Transparent Proxy ---
+    const proxyReq = createProxyReq();
     proxyReq.on('response', (proxyRes) => {
         res.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.pipe(res);
@@ -185,5 +224,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PROXY_PORT, "0.0.0.0", () => {
-    console.log(`[llama-cpp-agent-proxy] Listening on 0.0.0.0:${PROXY_PORT} -> ${TARGET_HOST}:${TARGET_PORT}`);
+    log(`[llama-cpp-agent-proxy] Listening on 0.0.0.0:${PROXY_PORT} -> ${TARGET_HOST}:${TARGET_PORT}`);
 });
