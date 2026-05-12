@@ -47,3 +47,5 @@ Remote `http(s)` image URLs also work when the upstream model supports vision.
 ## Why is this needed?
 
 While `llama-server` is extremely fast, its implementation of the newer `/v1/responses` endpoint is stricter than standard OpenAI. This proxy handles the "surgically required" patches to make agentic workflows seamless without sacrificing the raw performance of `llama.cpp`.
+
+This proxy does not send your data to any third-party service; it only forwards requests between your client and the local `llama-server` endpoint you configure.
