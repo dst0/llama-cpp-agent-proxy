@@ -7,6 +7,8 @@ const TARGET_PORT = parseInt(process.env.TARGET_PORT || '11435', 10);
 const PROXY_PORT = parseInt(process.env.PORT || '11437', 10);
 const LOG_FILE = process.env.LOG_FILE || 'proxy.log';
 const FULL_LOG_FILE = process.env.FULL_LOG_FILE || 'proxy-full.log';
+const NON_STOP_MODE = process.env.NON_STOP_MODE === 'true';
+let activeRequests = 0;
 
 const MAX_LOG_SIZE = 32 * 1024 * 1024;
 const MAX_LOG_FILES = 5;
@@ -294,17 +296,13 @@ function normalizeInputItem(item) {
         }];
     }
 
-    if (item.role === 'assistant' && Array.isArray(item.content) && item.content.length === 0) {
-        // Fallback to avoid dropping empty assistant responses entirely
-        item.content = [{ type: 'output_text', text: '' }];
-    }
-
     return item;
 }
 
 /**
- * When a streaming agentic response ends with only text (no tool calls), the
- * model may have narrated an intention without actually calling a tool. This
+ * When a streaming agentic response ends with only text (no tool calls) or
+ * is completely empty, the model may have narrated an intention without
+ * actually calling a tool, or it may have produced no output at all. This
  * function fires a follow-up request to llama-server within the same open
  * HTTP connection, asking the model to either act or confirm it is finished.
  * Returns a promise that resolves with any function_call items extracted from
@@ -322,7 +320,13 @@ function doFollowUp(originalJson, textContent, targetPort) {
                 role: 'user',
                 content: [{
                     type: 'input_text',
-                    text: 'You described an action but did not call a tool. If there is remaining work, call the appropriate tool now. If all work is genuinely complete, respond with only: FINISHED'
+                    text: textContent
+                        ? (NON_STOP_MODE
+                            ? 'You described an action but did not call a tool. If there is remaining work, call the appropriate tool now. If you are still working on the task, perform a next step of work on this task, or plan your actions and call a next tool you need for that. Otherwise continue working on the backlog or live-testing and fixing/polishing the app according to described in documentation flows.'
+                            : 'You described an action but did not call a tool. If there is remaining work, call the appropriate tool now. If you are still working on the task, perform a next step of work on this task, or plan your actions and call a next tool you need for that. If all work is genuinely complete, respond with only: FINISHED')
+                        : (NON_STOP_MODE
+                            ? 'You produced no output. Please reconsider and either call an appropriate tool to continue working on the task, or plan your actions and call a next tool you need for that. Continue working on the backlog or live-testing and fixing/polishing the app according to described in documentation flows.'
+                            : 'You produced no output. Please reconsider and either call an appropriate tool to continue working on the task, or respond with FINISHED if the task is genuinely complete.')
                 }]
             }
         ];
@@ -455,6 +459,17 @@ function createSseNormalizer(proxyRes, res, { onRawEvent, onNormalizedEvent, onC
 }
 
 const server = http.createServer((req, res) => {
+    activeRequests++;
+    let decremented = false;
+    const decrement = () => {
+        if (!decremented) {
+            activeRequests--;
+            decremented = true;
+        }
+    };
+    res.on('finish', decrement);
+    res.on('close', decrement);
+
     const isModels = req.method === 'GET' && req.url.startsWith('/v1/models');
     const isResponses = req.method === 'POST' && req.url.startsWith('/v1/responses');
 
@@ -599,7 +614,7 @@ const server = http.createServer((req, res) => {
             try {
                 const json = JSON.parse(body);
                 const targetPort = getTargetPortForModel(json.model);
-                log(`[Proxy] Request: ${json.model} (stream=${!!json.stream}) -> port ${targetPort}`);
+                log(`[Proxy] Request: ${json.model} (stream=${!!json.stream}) -> port ${targetPort} non_stop=${NON_STOP_MODE}`);
                 logFull({
                     type: 'request',
                     model: json.model,
@@ -616,7 +631,7 @@ const server = http.createServer((req, res) => {
                 if (Array.isArray(json.input)) {
                     json.input = json.input.flatMap(item => {
                         return normalizeInputItem(item);
-                    }).filter(Boolean);
+                    }).filter(Boolean).filter(item => !item.content || item.content.length > 0);
                 }
 
                 if (Array.isArray(json.tools)) {
@@ -729,8 +744,13 @@ const server = http.createServer((req, res) => {
 
                                 let mergedOutput = output;
 
-                                if (!hasFunctionCall && textContent && hasTools) {
-                                    log(`[Proxy] Text-only agentic response for ${json.model}; sending follow-up`);
+                                if (!hasFunctionCall && hasTools) {
+                                    // Follow-up for both empty responses and text-only responses
+                                    if (!textContent) {
+                                        log(`[Proxy] Empty agentic response for ${json.model}; sending empty-response follow-up`);
+                                    } else {
+                                        log(`[Proxy] Text-only agentic response for ${json.model}; sending follow-up`);
+                                    }
                                     const fcItems = await doFollowUp(json, textContent, targetPort);
 
                                     if (fcItems.length > 0) {
@@ -815,8 +835,59 @@ function restartLlamaService(reason) {
     });
 }
 
+function getGpuMetrics() {
+    try {
+        const busyPath = '/sys/class/drm/card0/device/gpu_busy_percent';
+        if (!fs.existsSync(busyPath)) return null;
+        const busy = parseInt(fs.readFileSync(busyPath, 'utf8').trim(), 10);
+        
+        // Find power path dynamically
+        const hwmonDir = '/sys/class/drm/card0/device/hwmon';
+        if (!fs.existsSync(hwmonDir)) return { busy, power: 0 };
+        
+        const hwmons = fs.readdirSync(hwmonDir);
+        let power = 0;
+        for (const h of hwmons) {
+            const pPath = `${hwmonDir}/${h}/power1_average`;
+            if (fs.existsSync(pPath)) {
+                power = parseInt(fs.readFileSync(pPath, 'utf8').trim(), 10) / 1000000; // Watts
+                break;
+            }
+        }
+        return { busy, power };
+    } catch (e) {
+        error(`[Monitor] Failed to get GPU metrics: ${e.message}`);
+        return null;
+    }
+}
+
+function checkStuckServer() {
+    if (activeRequests > 0) return;
+
+    const metrics = getGpuMetrics();
+    if (!metrics) return;
+
+    if (metrics.busy === 100 && metrics.power < 90) {
+        log(`[Monitor] Stuck detection: GPU ${metrics.busy}% busy, Power ${metrics.power.toFixed(2)}W, Active Requests: ${activeRequests}`);
+        log(`[Monitor] Killing llama-server processes to un-stuck...`);
+        exec("sudo kill -9 $(pgrep -f llama-server)", (err) => {
+            if (err) {
+                // If pgrep fails, maybe no processes found
+                if (err.code === 1) return; 
+                error(`[Monitor] Failed to kill llama-server: ${err.message}`);
+            } else {
+                log(`[Monitor] Killed stuck llama-server processes.`);
+                // systemctl will likely restart it if configured, but let's be sure
+                restartLlamaService('Manual kill of stuck process');
+            }
+        });
+    }
+}
+
 // 1. Regular liveness ping (once a minute)
 setInterval(() => {
+    checkStuckServer();
+
     const options = {
         hostname: TARGET_HOST,
         port: TARGET_PORT,

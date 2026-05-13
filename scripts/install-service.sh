@@ -6,6 +6,7 @@ SERVICE_NAME="${SERVICE_NAME:-llama-cpp-agent-proxy}"
 TARGET_HOST="${TARGET_HOST:-127.0.0.1}"
 TARGET_PORT="${TARGET_PORT:-11435}"
 PORT="${PORT:-11437}"
+NON_STOP_MODE="${NON_STOP_MODE:-false}"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -25,9 +26,13 @@ while [[ $# -gt 0 ]]; do
             PORT="$2"
             shift 2
             ;;
+        --non-stop-mode)
+            NON_STOP_MODE="$2"
+            shift 2
+            ;;
         -h|--help)
             cat <<EOF
-Usage: $(basename "$0") [--service-name NAME] [--target-host HOST] [--target-port PORT] [--port PORT]
+Usage: $(basename "$0") [--service-name NAME] [--target-host HOST] [--target-port PORT] [--port PORT] [--non-stop-mode MODE]
 
 Installs a user service for the proxy on macOS (LaunchAgent) or Ubuntu/Linux (systemd user service).
 EOF
@@ -88,6 +93,8 @@ install_launchd() {
         <string>${TARGET_PORT}</string>
         <key>PORT</key>
         <string>${PORT}</string>
+        <key>NON_STOP_MODE</key>
+        <string>${NON_STOP_MODE}</string>
     </dict>
     <key>WorkingDirectory</key>
     <string>${ROOT_DIR}</string>
@@ -130,6 +137,7 @@ WorkingDirectory=${ROOT_DIR}
 Environment=TARGET_HOST=${TARGET_HOST}
 Environment=TARGET_PORT=${TARGET_PORT}
 Environment=PORT=${PORT}
+Environment=NON_STOP_MODE=${NON_STOP_MODE}
 ExecStart=${NODE_BIN} ${ROOT_DIR}/index.js
 Restart=on-failure
 RestartSec=2

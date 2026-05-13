@@ -21,6 +21,49 @@ A high-performance, transparent compatibility bridge between **Codex** (and othe
    ```
 4. Point your client to `http://<your-ip>:11437/v1`.
 
+### Environment Variables
+
+Copy `.env.example` to `.env` and adjust values as needed. The proxy supports the following variables:
+
+- `TARGET_HOST` — Host of the upstream `llama-server` (default: `127.0.0.1`).
+- `TARGET_PORT` — Port of the upstream `llama-server` (default: `11435`).
+- `PORT` — Port the proxy listens on (default: `11437`).
+- `LOG_FILE` — Path to concise log file (default: `proxy.log`).
+- `FULL_LOG_FILE` — Path to full log file (default: `proxy-full.log`).
+- `NON_STOP_MODE` — When `true`, the proxy sends follow-up prompts that encourage the model to continue working on the backlog or live-testing/fixing/polishing the app according to documentation flows instead of just calling a tool. `FINISHED` is NOT accepted as a completion signal when `NON_STOP_MODE` is `true`. Default: `false` (disabled, `FINISHED` is accepted).
+
+### Two Proxy Instances
+
+Run two proxy instances on different ports so different agents can use different modes:
+
+#### Quick start (foreground)
+
+```bash
+bash scripts/run-two-proxies.sh
+```
+
+This starts:
+- **Port 11441** — `NON_STOP_MODE=true` (FINISHED rejected, encourages backlog/polishing)
+- **Port 11440** — `NON_STOP_MODE=false` (FINISHED accepted, standard mode)
+
+Each agent connects to its designated proxy URL:
+- Non-stop agent: `http://localhost:11441/v1`
+- Stop agent: `http://localhost:11440/v1`
+
+#### Persistent services (recommended)
+
+Install both as background services:
+
+```bash
+bash scripts/install-two-services.sh
+```
+
+Uninstall both:
+
+```bash
+bash scripts/uninstall-two-services.sh
+```
+
 ## Run as a service
 
 Use the installer to register the proxy as a user service on macOS (LaunchAgent) or Ubuntu/Linux (systemd user):
