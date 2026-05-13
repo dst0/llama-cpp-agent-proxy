@@ -737,6 +737,8 @@ test('Proxy should inject model metadata', async (t) => {
         assert.strictEqual(model.display_name, 'upstream-model');
         assert.strictEqual(model.slug, 'upstream-model');
         assert.ok(model.supported_reasoning_levels);
+        assert.ok(model.truncation_policy, 'Model should have truncation_policy');
+        assert.strictEqual(model.truncation_policy.type, 'auto');
     } finally {
         proxy.kill();
         mockUpstream.close();

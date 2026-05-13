@@ -106,7 +106,8 @@ const MODEL_TEMPLATE = {
     "base_instructions": "",
     "instructions_variables": {},
     "additional_speed_tiers": ["fast"],
-    "service_tiers": [{ "id": "priority", "name": "Fast", "description": "Local priority" }]
+    "service_tiers": [{ "id": "priority", "name": "Fast", "description": "Local priority" }],
+    "truncation_policy": { "type": "auto" }
 };
 
 function normalizeContentPart(part, role = 'user') {
@@ -294,7 +295,8 @@ function normalizeInputItem(item) {
     }
 
     if (item.role === 'assistant' && Array.isArray(item.content) && item.content.length === 0) {
-        return null;
+        // Fallback to avoid dropping empty assistant responses entirely
+        item.content = [{ type: 'output_text', text: '' }];
     }
 
     return item;
