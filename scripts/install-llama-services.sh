@@ -84,6 +84,7 @@ echo "Setting up lms-micro (LM Studio)..."
 # Create a small script to start lms and load the model
 cat > /opt/llama/bin/start-lms-micro.sh <<EOF
 #!/usr/bin/env bash
+/home/dst/.lmstudio/bin/lms runtime select llama.cpp-linux-x86_64-avx2@2.13.0
 /home/dst/.lmstudio/bin/lms server stop || true
 /home/dst/.lmstudio/bin/lms server start --port 1234 --bind 0.0.0.0
 sleep 2
