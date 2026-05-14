@@ -817,7 +817,14 @@ const server = http.createServer((req, res) => {
                                         
                                         // 1. Simulate Reasoning
                                         const rsId = `rs_proxy_${Math.random().toString(36).slice(2, 11)}`;
-                                        const rsText = "hmm.. Let me continue...";
+                                        const variants = [
+                                            "hmm.. Let me continue...",
+                                            "Right, let me keep going...",
+                                            "Continuing with the next steps...",
+                                            "Let me proceed with the task...",
+                                            "I'll continue working on this..."
+                                        ];
+                                        const rsText = variants[Math.floor(Math.random() * variants.length)];
                                         const rsItem = { 
                                             type: 'reasoning', 
                                             id: rsId, 
