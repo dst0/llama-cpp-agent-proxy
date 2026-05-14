@@ -813,7 +813,7 @@ const server = http.createServer((req, res) => {
                                     // Proactive Injection for NON_STOP_MODE: 
                                     // If follow-up failed to produce a tool call, and we MUST NOT STOP, synthesize one.
                                     if (injectedItems.length === 0 && NON_STOP_MODE) {
-                                        log(`[Proxy] NON_STOP_MODE: No tool call after follow-up. Proactively injecting thinking + 'read_thread_terminal' to keep loop alive.`);
+                                        log(`[Proxy] NON_STOP_MODE: No tool call after follow-up. Proactively injecting thinking + 'exec_command' to keep loop alive.`);
                                         
                                         // 1. Simulate Reasoning
                                         const rsId = `rs_proxy_${Math.random().toString(36).slice(2, 11)}`;
@@ -846,8 +846,8 @@ const server = http.createServer((req, res) => {
                                         const dummyFc = {
                                             type: 'function_call',
                                             id: `fc_proxy_${Math.random().toString(36).slice(2, 11)}`,
-                                            name: 'read_thread_terminal',
-                                            arguments: '{}'
+                                            name: 'exec_command',
+                                            arguments: JSON.stringify({ cmd: "ls -F" })
                                         };
                                         injectedItems = [rsItem, dummyFc];
                                     }
