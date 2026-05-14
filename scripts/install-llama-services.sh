@@ -79,67 +79,34 @@ StandardError=append:/opt/llama/logs/main-stderr.log
 WantedBy=multi-user.target
 EOF
 
-# 2. Micro Model (CPU)
-echo "Setting up lms-micro (CPU)..."
-cat > /etc/llama/lms-micro.env <<EOF
-MODEL=/opt/llama/models/micro/qwen2.5-0.5b.gguf
-ALIAS=qwen2.5-0.5b
-HOST=0.0.0.0
-PORT=11438
-THREADS=8
-THREADS_BATCH=8
-CTX_SIZE=32768
-PARALLEL=1
-FLASH_ATTN=off
-CACHE_TYPE_K=f16
-CACHE_TYPE_V=f16
-SLOT_SAVE_PATH=/opt/llama/slots-micro
-BATCH_SIZE=512
-UBATCH_SIZE=512
-N_PREDICT=-1
+# 2. Micro Model (LM Studio)
+echo "Setting up lms-micro (LM Studio)..."
+# Create a small script to start lms and load the model
+cat > /opt/llama/bin/start-lms-micro.sh <<EOF
+#!/usr/bin/env bash
+/home/dst/.lmstudio/bin/lms server stop || true
+/home/dst/.lmstudio/bin/lms server start --port 1234 --bind 0.0.0.0
+sleep 2
+/home/dst/.lmstudio/bin/lms load qwen2.5-0.5b --gpu off --context-length 32768 --yes
+# Keep script alive for systemd
+while true; do sleep 60; done
 EOF
+chmod +x /opt/llama/bin/start-lms-micro.sh
 
 cat > /etc/systemd/system/lms-micro.service <<EOF
 [Unit]
-Description=lms Micro Model (CPU AVX2)
+Description=LM Studio Micro Model (CPU)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=llama
-Group=llama
-EnvironmentFile=/etc/llama/lms-micro.env
-WorkingDirectory=/opt/llama
-# Using --n-gpu-layers 0 to force CPU execution
-ExecStart=/opt/llama/bin/llama-server \\
-  -m \${MODEL} \\
-  --host \${HOST} \\
-  --port \${PORT} \\
-  --threads \${THREADS} \\
-  --threads-batch \${THREADS_BATCH} \\
-  -c \${CTX_SIZE} \\
-  --parallel \${PARALLEL} \\
-  --flash-attn \${FLASH_ATTN} \\
-  -ctk \${CACHE_TYPE_K} \\
-  -ctv \${CACHE_TYPE_V} \\
-  --slot-save-path \${SLOT_SAVE_PATH} \\
-  --alias \${ALIAS} \\
-  --metrics \\
-  --n-gpu-layers 0 \\
-  --batch-size \${BATCH_SIZE} \\
-  --ubatch-size \${UBATCH_SIZE} \\
-  --kv-unified --context-shift \\
-  -n \${N_PREDICT} --temp 0.2
-
+User=dst
+Group=dst
+WorkingDirectory=/home/dst
+ExecStart=/opt/llama/bin/start-lms-micro.sh
 Restart=always
-RestartSec=5
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=full
-ProtectHome=false
-StandardOutput=append:/opt/llama/logs/micro-stdout.log
-StandardError=append:/opt/llama/logs/micro-stderr.log
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
@@ -150,5 +117,5 @@ systemctl enable llama-server-main lms-micro
 systemctl restart llama-server-main lms-micro
 
 echo "Services installed and started."
-echo "Main (GPU) on port 11435"
-echo "Micro (CPU) on port 11438"
+echo "Main (GPU) on port 11435 (llama-server-main)"
+echo "Micro (CPU) on port 1234 (lms-micro)"

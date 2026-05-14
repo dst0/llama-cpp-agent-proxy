@@ -510,7 +510,8 @@ const server = http.createServer((req, res) => {
                     res.on('end', () => {
                         try {
                             const json = JSON.parse(body);
-                            if (json.models?.some(m => m.name === modelName || m.slug === modelName)) {
+                            const models = json.models || json.data || [];
+                            if (models.some(m => (m.name || m.id) === modelName || m.slug === modelName)) {
                                 resolve(port);
                             } else {
                                 resolve(null);
@@ -625,21 +626,26 @@ const server = http.createServer((req, res) => {
             let allModels = [];
             let statusCode = 502;
             for (const result of results) {
-                if (result && result.json && Array.isArray(result.json.models)) {
-                    statusCode = 200;
-                    const enhancedModels = result.json.models.map(m => {
-                        const capabilities = ["completion"];
-                        if (result.props.modalities?.vision) capabilities.push("multimodal", "vision");
-                        
-                        return { 
-                            ...MODEL_TEMPLATE, 
-                            ...m,
-                            slug: m.slug || m.name || m.model || MODEL_TEMPLATE.slug,
-                            display_name: m.display_name || m.name || m.model || MODEL_TEMPLATE.display_name,
-                            capabilities: capabilities
-                        };
-                    });
-                    allModels = allModels.concat(enhancedModels);
+                if (result && result.json) {
+                    const models = result.json.models || result.json.data || [];
+                    if (Array.isArray(models)) {
+                        statusCode = 200;
+                        const enhancedModels = models.map(m => {
+                            const capabilities = ["completion"];
+                            if (result.props.modalities?.vision) capabilities.push("multimodal", "vision");
+                            
+                            const name = m.name || m.id || m.model || MODEL_TEMPLATE.slug;
+                            return { 
+                                ...MODEL_TEMPLATE, 
+                                ...m,
+                                name: name,
+                                slug: m.slug || name,
+                                display_name: m.display_name || name,
+                                capabilities: capabilities
+                            };
+                        });
+                        allModels = allModels.concat(enhancedModels);
+                    }
                 }
             }
 
