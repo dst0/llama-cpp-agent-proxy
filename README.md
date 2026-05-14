@@ -5,120 +5,84 @@ A high-performance, transparent compatibility bridge between **Codex** (and othe
 ## Features
 
 - **Transparent Mirroring**: Directly pipes all traffic by default, supporting **Streaming (SSE)** perfectly.
+- **Dynamic Multi-Backend Routing**: Automatically discovers models across multiple `llama-server` instances and routes requests to the correct backend based on the requested model name.
 - **Agentic Tool Flattening**: Automatically converts nested OpenAI function definitions into the flat format required by `llama-server`'s `/v1/responses` endpoint.
 - **Response Content Normalization**: Rewrites assistant message content into OpenAI-friendly `output_text` / `refusal` parts and preserves reasoning-only responses instead of collapsing them to empty output.
 - **Exhaustive Metadata Patching**: Injects mandatory contract fields (`slug`, `display_name`, `supported_reasoning_levels`, etc.) to satisfy strict client-side model managers.
-- **Reasoning Level Support**: Advertises and maps reasoning levels (Minimal, Low, Medium, High, Extra High) for local models.
+- **Liveness Monitoring**: Background monitoring for all backends with automatic service restarts if an upstream instance becomes unresponsive or fails health checks.
 - **Network Ready**: Binds to `0.0.0.0` for full LAN accessibility.
+
+## Two Proxy Architecture
+
+Run two proxy instances on different ports so different agents can use different behaviors:
+
+- **Port 11451 (Non-Stop Mode)**: Rejects `FINISHED` responses from models. If a model tries to stop without calling a tool, the proxy injects a follow-up prompt encouraging it to continue working on the backlog, live-testing, or polishing the app.
+- **Port 11450 (Standard Mode)**: Accepts `FINISHED` responses. Use this for standard agentic workflows.
+
+### Backend Configuration (GPU & CPU)
+
+The proxy supports routing to specialized backends:
+
+1.  **Main Model (`llama-server-main`)**:
+    - **Port**: `11435`
+    - **Execution**: Full GPU (Vulkan/ROCm)
+    - **Optimized**: 64k Context window with `iq4_nl` KV cache quantization to fit 27B+ models in 16GB VRAM.
+2.  **Micro Model (`lms-micro`)**:
+    - **Port**: `11438`
+    - **Execution**: Strict CPU (AVX2) using `--n-gpu-layers 0`.
+    - **Optimized**: Fast, low-latency responses for simple tasks.
 
 ## Quick Start
 
-1. Ensure `node` (v20+) is installed.
-2. Run your `llama-server` on port `11435`.
-3. Start the proxy:
-   ```bash
-   node index.js
-   ```
-4. Point your client to `http://<your-ip>:11437/v1`.
+### 1. Install Backend Services
 
-### Environment Variables
-
-Copy `.env.example` to `.env` and adjust values as needed. The proxy supports the following variables:
-
-- `TARGET_HOST` — Host of the upstream `llama-server` (default: `127.0.0.1`).
-- `TARGET_PORT` — Port of the upstream `llama-server` (default: `11435`).
-- `PORT` — Port the proxy listens on (default: `11437`).
-- `LOG_FILE` — Path to concise log file (default: `proxy.log`).
-- `FULL_LOG_FILE` — Path to full log file (default: `proxy-full.log`).
-- `NON_STOP_MODE` — When `true`, the proxy sends follow-up prompts that encourage the model to continue working on the backlog or live-testing/fixing/polishing the app according to documentation flows instead of just calling a tool. `FINISHED` is NOT accepted as a completion signal when `NON_STOP_MODE` is `true`. Default: `false` (disabled, `FINISHED` is accepted).
-
-### Two Proxy Instances
-
-Run two proxy instances on different ports so different agents can use different modes:
-
-#### Quick start (foreground)
+Run the specialized installer to set up both GPU and CPU backend instances:
 
 ```bash
-bash scripts/run-two-proxies.sh
+sudo bash scripts/install-llama-services.sh
 ```
 
-This starts:
-- **Port 11451** — `NON_STOP_MODE=true` (FINISHED rejected, encourages backlog/polishing)
-- **Port 11450** — `NON_STOP_MODE=false` (FINISHED accepted, standard mode)
+To uninstall backends:
 
-Each agent connects to its designated proxy URL:
-- Non-stop agent: `http://localhost:11451/v1`
-- Stop agent: `http://localhost:11450/v1`
+```bash
+sudo bash scripts/uninstall-llama-services.sh
+```
 
-#### Persistent services (recommended)
+### 2. Install Proxy Services
 
-Install both as background services:
+Install both the Standard and Non-Stop proxy instances as persistent background services:
 
 ```bash
 bash scripts/install-two-services.sh
 ```
 
-Uninstall both:
+### 3. Usage
 
-```bash
-bash scripts/uninstall-two-services.sh
-```
+Point your agents to the desired proxy:
+- **Non-stop agent**: `http://localhost:11451/v1`
+- **Standard agent**: `http://localhost:11450/v1`
 
-## Run as a service
+## Environment Variables
 
-Use the installer to register the proxy as a user service on macOS (LaunchAgent) or Ubuntu/Linux (systemd user):
+The proxy supports the following variables (configured automatically by the scripts):
 
-```bash
-bash scripts/install-service.sh
-```
-
-Running the installer again performs a clean reinstall: it stops the existing service, kills any running
-proxy process for this repo, and starts the service again with the updated configuration.
-
-You can override the defaults with `TARGET_HOST`, `TARGET_PORT`, `PORT`, or `--service-name`.
-
-To remove the service again:
-
-```bash
-bash scripts/uninstall-service.sh
-```
-
-Uninstall performs a clean shutdown too: it stops the managed service and kills any running proxy
-process for this repo before removing the user service definition.
-
-## Testing
-
-Run the local test suite with:
-
-```bash
-npm test
-```
-
-The suite includes a live regression test for the text-only agentic failure mode. Enable it with:
-
-```bash
-RUN_LIVE_PROXY_TESTS=1 npm test
-```
-
-That live check expects the proxy to be running on `11437` and watches `proxy-full.log` for the
-follow-up request and injected tool-call events.
+- `BACKEND_PORTS` — Comma-separated list of upstream ports (default: `11435,11438`).
+- `BACKEND_SERVICES` — Comma-separated list of systemd service names for monitoring (default: `llama-server-main,lms-micro`).
+- `PORT` — Port the proxy listens on (e.g., `11450` or `11451`).
+- `NON_STOP_MODE` — When `true`, enables the "never finished" agentic behavior.
+- `MONITOR_ENABLED` — Enables background liveness monitoring and auto-restarts (default: `true`).
+- `LOG_DIR` — Directory for logs (default: `~/.llama-cpp-agent-proxy/logs/<port>`).
+- `LOG_FILE` — Path to concise log file.
+- `FULL_LOG_FILE` — Path to full JSON log file for observability.
 
 ## Observability
 
-`proxy.log` contains the concise request/stream summary, while `proxy-full.log` records sanitized
-request bodies, upstream SSE events, proxy-normalized SSE events, follow-up retries, and terminal
-stream summaries.
+`proxy.log` contains concise request summaries. `proxy-full.log` records sanitized request/response bodies, SSE events, follow-up retries, and detailed metrics for debugging agentic flows.
 
-## Multimodal image input
+## Multimodal Image Input
 
-For image requests, use a vision-capable `llama-server` model with a matching `--mmproj`.
-If you want to load local files, set `--media-path` and keep the path slash-terminated, then send
-`input_image` parts with `image_url` values like `file://test.png`.
-
-Remote `http(s)` image URLs also work when the upstream model supports vision.
+For image requests, use a vision-capable backend model with a matching `--mmproj`. Remote `http(s)` image URLs and local `file://` paths are supported.
 
 ## Why is this needed?
 
 While `llama-server` is extremely fast, its implementation of the newer `/v1/responses` endpoint is stricter than standard OpenAI. This proxy handles the "surgically required" patches to make agentic workflows seamless without sacrificing the raw performance of `llama.cpp`.
-
-This proxy stays entirely local; it only forwards requests between your client and the `llama-server` endpoint you configure on the same machine.

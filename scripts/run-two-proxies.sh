@@ -12,11 +12,11 @@ pkill -f 'node index.js' 2>/dev/null || true
 sleep 1
 
 # Start NON_STOP_MODE=true proxy on port 11451
-NON_STOP_MODE=true PORT=11451 node index.js &
+BACKEND_PORTS="11435,11438" BACKEND_SERVICES="llama-server-main,lms-micro" NON_STOP_MODE=true PORT=11451 node index.js &
 echo "Started NON_STOP_MODE=true proxy on port 11451"
 
 # Start NON_STOP_MODE=false proxy on port 11450
-NON_STOP_MODE=false PORT=11450 node index.js &
+BACKEND_PORTS="11435,11438" BACKEND_SERVICES="llama-server-main,lms-micro" NON_STOP_MODE=false PORT=11450 node index.js &
 echo "Started NON_STOP_MODE=false proxy on port 11450"
 
 echo "Both proxies are running."
