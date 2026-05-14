@@ -43,12 +43,12 @@ bash scripts/run-two-proxies.sh
 ```
 
 This starts:
-- **Port 11441** — `NON_STOP_MODE=true` (FINISHED rejected, encourages backlog/polishing)
-- **Port 11440** — `NON_STOP_MODE=false` (FINISHED accepted, standard mode)
+- **Port 11451** — `NON_STOP_MODE=true` (FINISHED rejected, encourages backlog/polishing)
+- **Port 11450** — `NON_STOP_MODE=false` (FINISHED accepted, standard mode)
 
 Each agent connects to its designated proxy URL:
-- Non-stop agent: `http://localhost:11441/v1`
-- Stop agent: `http://localhost:11440/v1`
+- Non-stop agent: `http://localhost:11451/v1`
+- Stop agent: `http://localhost:11450/v1`
 
 #### Persistent services (recommended)
 

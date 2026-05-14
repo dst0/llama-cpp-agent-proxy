@@ -11,14 +11,14 @@ cd "$SCRIPT_DIR/.."
 pkill -f 'node index.js' 2>/dev/null || true
 sleep 1
 
-# Start NON_STOP_MODE=true proxy on port 11441
-NON_STOP_MODE=true PORT=11441 node index.js &
-echo "Started NON_STOP_MODE=true proxy on port 11441"
+# Start NON_STOP_MODE=true proxy on port 11451
+NON_STOP_MODE=true PORT=11451 node index.js &
+echo "Started NON_STOP_MODE=true proxy on port 11451"
 
-# Start NON_STOP_MODE=false proxy on port 11440
-NON_STOP_MODE=false PORT=11440 node index.js &
-echo "Started NON_STOP_MODE=false proxy on port 11440"
+# Start NON_STOP_MODE=false proxy on port 11450
+NON_STOP_MODE=false PORT=11450 node index.js &
+echo "Started NON_STOP_MODE=false proxy on port 11450"
 
 echo "Both proxies are running."
-echo "  Non-stop mode (FINISHED rejected): http://localhost:11441/v1"
-echo "  Stop mode (FINISHED accepted):      http://localhost:11440/v1"
+echo "  Non-stop mode (FINISHED rejected): http://localhost:11451/v1"
+echo "  Stop mode (FINISHED accepted):      http://localhost:11450/v1"

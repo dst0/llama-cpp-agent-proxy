@@ -6,37 +6,47 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { Buffer } from 'node:buffer';
+import { getAvailablePort, startMockUpstream } from './helpers.js';
 
-const MOCK_UPSTREAM_PORT = 11440;
-const PROXY_PORT = 11441;
 const TEST_LOG_FILE = path.join(os.tmpdir(), `llama-cpp-agent-proxy-test-${process.pid}.log`);
 
-// Helper to start the proxy
-function startProxy(envOverrides = {}) {
-    return spawn('node', ['index.js'], {
-        env: {
-            ...process.env,
-            TARGET_PORT: MOCK_UPSTREAM_PORT.toString(),
-            PORT: PROXY_PORT.toString(),
-            LOG_FILE: TEST_LOG_FILE,
-            ...envOverrides
+async function startProxy(envOverrides = {}, proxyPort, targetPort) {
+    const proxyPortStr = proxyPort ?? await getAvailablePort();
+    const targetPortStr = targetPort ?? 11460;
+    return new Promise(async (resolve, reject) => {
+        const child = spawn('node', ['index.js'], {
+            env: {
+                ...process.env,
+                TARGET_PORT: targetPortStr.toString(),
+                PORT: proxyPortStr.toString(),
+                LOG_FILE: TEST_LOG_FILE,
+                ...envOverrides
+            }
+        });
+        const wait = new Promise((ok) => {
+            const check = () => {
+                const req = http.get(`http://localhost:${proxyPortStr}/v1/models`, (res) => {
+                    res.destroy();
+                    ok();
+                });
+                req.on('error', () => setTimeout(check, 50));
+            };
+            check();
+        });
+        try {
+            await wait;
+            resolve({ child, proxyPort: proxyPortStr });
+        } catch (e) {
+            reject(e);
         }
     });
 }
 
-// Helper to start a mock upstream
-function startMockUpstream(onReq) {
-    const server = http.createServer(onReq);
-    return new Promise((resolve) => {
-        server.listen(MOCK_UPSTREAM_PORT, () => resolve(server));
-    });
-}
-
-function requestProxy({ path: requestPath, method, body, headers, timeout = 0 }) {
+function requestProxy({ path: requestPath, method, body, headers, timeout = 0 }, proxyPort) {
     return new Promise((resolve, reject) => {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: requestPath,
             method,
             headers
@@ -68,8 +78,33 @@ function requestProxy({ path: requestPath, method, body, headers, timeout = 0 })
     });
 }
 
-test('Proxy should flatten tool calls', async (t) => {
+async function runTest(name, fn) {
+    test(name, async (t) => {
+        console.log(`\n[TEST START] ${name}`);
+        const state = { mockServers: [], proxy: null };
+
+        const cleanup = async () => {
+            if (state.proxy) {
+                try { state.proxy.kill('SIGKILL'); } catch {}
+            }
+            for (const ms of state.mockServers) {
+                try { ms.close(); } catch {}
+            }
+        };
+
+        process.on('exit', () => cleanup());
+
+        try {
+            await fn({ state, cleanup });
+        } finally {
+            await cleanup();
+        }
+    });
+}
+
+runTest('Proxy should flatten tool calls', async ({ state, cleanup }) => {
     let receivedBody = null;
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
         let chunks = [];
         req.on('data', chunk => chunks.push(chunk));
@@ -78,10 +113,16 @@ test('Proxy should flatten tool calls', async (t) => {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ output: [] }));
         });
-    });
+    }, mockPort);
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for proxy to start
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const payload = {
@@ -99,7 +140,7 @@ test('Proxy should flatten tool calls', async (t) => {
 
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/responses',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -120,28 +161,33 @@ test('Proxy should flatten tool calls', async (t) => {
         assert.strictEqual(receivedBody.tools[0].type, 'function');
         assert.strictEqual(receivedBody.tools[0].function, undefined);
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should handle streaming', async (t) => {
+runTest('Proxy should handle streaming', async ({ state, cleanup }) => {
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
-        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' }, mockPort, mockPort, mockPort);
         res.write('data: {"text": "Hello"}\n\n');
         setTimeout(() => {
             res.write('data: {"text": " World"}\n\n');
             res.end();
         }, 100);
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/responses',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -163,13 +209,12 @@ test('Proxy should handle streaming', async (t) => {
         assert.ok(fullResponse.includes('Hello'));
         assert.ok(fullResponse.includes('World'));
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should normalize tool outputs for llama-server', async () => {
+runTest('Proxy should normalize tool outputs for llama-server', async ({ state, cleanup }) => {
     let receivedBody = null;
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
         let chunks = [];
         req.on('data', chunk => chunks.push(chunk));
@@ -178,15 +223,21 @@ test('Proxy should normalize tool outputs for llama-server', async () => {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ output: [] }));
         });
-    });
+    }, mockPort);
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/responses',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -228,13 +279,12 @@ test('Proxy should normalize tool outputs for llama-server', async () => {
             output: [{ type: 'input_text', text: 'Done' }]
         });
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should preserve input_text parts for llama-server', async () => {
+runTest('Proxy should preserve input_text parts for llama-server', async ({ state, cleanup }) => {
     let receivedBody = null;
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
         const chunks = [];
         req.on('data', chunk => chunks.push(chunk));
@@ -244,9 +294,15 @@ test('Proxy should preserve input_text parts for llama-server', async () => {
             res.end(JSON.stringify({ output: [] }));
         });
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         await requestProxy({
@@ -262,19 +318,18 @@ test('Proxy should preserve input_text parts for llama-server', async () => {
                     }
                 ]
             })
-        });
+        }, proxyPort);
 
         assert.deepStrictEqual(receivedBody.input[0].content, [
             { type: 'input_text', text: 'hi there' }
         ]);
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should preserve function_call items for llama-server', async () => {
+runTest('Proxy should preserve function_call items for llama-server', async ({ state, cleanup }) => {
     let receivedBody = null;
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
         const chunks = [];
         req.on('data', chunk => chunks.push(chunk));
@@ -284,9 +339,15 @@ test('Proxy should preserve function_call items for llama-server', async () => {
             res.end(JSON.stringify({ output: [] }));
         });
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         await requestProxy({
@@ -304,7 +365,7 @@ test('Proxy should preserve function_call items for llama-server', async () => {
                     }
                 ]
             })
-        });
+        }, proxyPort);
 
         assert.deepStrictEqual(receivedBody.input[0], {
             type: 'function_call',
@@ -313,13 +374,12 @@ test('Proxy should preserve function_call items for llama-server', async () => {
             arguments: '{"city":"Paris"}'
         });
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should drop reasoning-only assistant turns before forwarding', async () => {
+runTest('Proxy should drop reasoning-only assistant turns before forwarding', async ({ state, cleanup }) => {
     let receivedBody = null;
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
         const chunks = [];
         req.on('data', chunk => chunks.push(chunk));
@@ -329,9 +389,15 @@ test('Proxy should drop reasoning-only assistant turns before forwarding', async
             res.end(JSON.stringify({ output: [] }));
         });
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         await requestProxy({
@@ -351,7 +417,7 @@ test('Proxy should drop reasoning-only assistant turns before forwarding', async
                     }
                 ]
             })
-        });
+        }, proxyPort);
 
         assert.deepStrictEqual(receivedBody.input, [
             {
@@ -361,14 +427,13 @@ test('Proxy should drop reasoning-only assistant turns before forwarding', async
             }
         ]);
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should normalize streaming assistant content', async () => {
+runTest('Proxy should normalize streaming assistant content', async ({ state, cleanup }) => {
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
-        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' }, mockPort, mockPort, mockPort);
         res.write('data: ' + JSON.stringify({
             output: [
                 {
@@ -385,14 +450,20 @@ test('Proxy should normalize streaming assistant content', async () => {
         }) + '\n\n');
         res.end();
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/responses',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -414,13 +485,12 @@ test('Proxy should normalize streaming assistant content', async () => {
         assert.ok(body.includes('Hello from stream'));
         assert.ok(!body.includes('reasoning_text'));
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should normalize input images for llama-server', async () => {
+runTest('Proxy should normalize input images for llama-server', async ({ state, cleanup }) => {
     let receivedBody = null;
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
         let chunks = [];
         req.on('data', chunk => chunks.push(chunk));
@@ -429,15 +499,21 @@ test('Proxy should normalize input images for llama-server', async () => {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ output: [] }));
         });
-    });
+    }, mockPort);
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/responses',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -470,13 +546,12 @@ test('Proxy should normalize input images for llama-server', async () => {
             { type: 'input_text', text: 'Describe this image' }
         ]);
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should preserve assistant output text for llama-server', async () => {
+runTest('Proxy should preserve assistant output text for llama-server', async ({ state, cleanup }) => {
     let receivedBody = null;
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
         let chunks = [];
         req.on('data', chunk => chunks.push(chunk));
@@ -485,15 +560,21 @@ test('Proxy should preserve assistant output text for llama-server', async () =>
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ output: [] }));
         });
-    });
+    }, mockPort);
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/responses',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -528,14 +609,13 @@ test('Proxy should preserve assistant output text for llama-server', async () =>
             { type: 'refusal', refusal: 'Nope' }
         ]);
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should strip reasoning outputs', async () => {
+runTest('Proxy should strip reasoning outputs', async ({ state, cleanup }) => {
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.writeHead(200, { 'Content-Type': 'application/json' }, mockPort, mockPort, mockPort);
         res.end(JSON.stringify({
             output: [
                 {
@@ -554,14 +634,20 @@ test('Proxy should strip reasoning outputs', async () => {
             ]
         }));
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/responses',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -590,14 +676,13 @@ test('Proxy should strip reasoning outputs', async () => {
             }
         ]);
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should preserve reasoning-only outputs', async () => {
+runTest('Proxy should preserve reasoning-only outputs', async ({ state, cleanup }) => {
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.writeHead(200, { 'Content-Type': 'application/json' }, mockPort, mockPort, mockPort);
         res.end(JSON.stringify({
             output: [
                 {
@@ -609,14 +694,20 @@ test('Proxy should preserve reasoning-only outputs', async () => {
             ]
         }));
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/responses',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -644,14 +735,13 @@ test('Proxy should preserve reasoning-only outputs', async () => {
             }
         ]);
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should normalize assistant response content', async () => {
+runTest('Proxy should normalize assistant response content', async ({ state, cleanup }) => {
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.writeHead(200, { 'Content-Type': 'application/json' }, mockPort, mockPort, mockPort);
         res.end(JSON.stringify({
             output: [
                 {
@@ -668,14 +758,20 @@ test('Proxy should normalize assistant response content', async () => {
             ]
         }));
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/responses',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -699,24 +795,29 @@ test('Proxy should normalize assistant response content', async () => {
             { type: 'refusal', refusal: 'Nope' }
         ]);
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should inject model metadata', async (t) => {
+runTest('Proxy should inject model metadata', async ({ state, cleanup }) => {
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.writeHead(200, { 'Content-Type': 'application/json' }, mockPort, mockPort, mockPort);
         res.end(JSON.stringify({ models: [{ name: 'upstream-model' }] }));
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/models',
             method: 'GET'
         });
@@ -740,15 +841,14 @@ test('Proxy should inject model metadata', async (t) => {
         assert.ok(model.truncation_policy, 'Model should have truncation_policy');
         assert.strictEqual(model.truncation_policy.type, 'auto');
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should handle stalled upstream props requests', async () => {
+runTest('Proxy should handle stalled upstream props requests', async ({ state, cleanup }) => {
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
         if (req.url === '/v1/models') {
-            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.writeHead(200, { 'Content-Type': 'application/json' }, mockPort, mockPort, mockPort);
             res.end(JSON.stringify({ models: [{ name: 'upstream-model' }] }));
             return;
         }
@@ -760,30 +860,35 @@ test('Proxy should handle stalled upstream props requests', async () => {
         res.writeHead(404);
         res.end();
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const response = await requestProxy({
             path: '/v1/models',
             method: 'GET',
             timeout: 1500
-        });
+        }, proxyPort);
 
         assert.strictEqual(response.statusCode, 200);
         const json = JSON.parse(response.body);
         assert.strictEqual(json.models[0].name, 'upstream-model');
         assert.strictEqual(json.models[0].display_name, 'upstream-model');
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should honor LOG_FILE without logging request content', async () => {
+runTest('Proxy should honor LOG_FILE without logging request content', async ({ state, cleanup }) => {
     const logFile = path.join(os.tmpdir(), `llama-cpp-agent-proxy-log-${process.pid}-${Date.now()}.log`);
     let receivedBody = null;
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
         const chunks = [];
         req.on('data', chunk => chunks.push(chunk));
@@ -793,9 +898,14 @@ test('Proxy should honor LOG_FILE without logging request content', async () => 
             res.end(JSON.stringify({ output: [] }));
         });
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
 
-    const proxy = startProxy({ LOG_FILE: logFile });
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({ LOG_FILE: logFile }, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         await requestProxy({
@@ -811,22 +921,23 @@ test('Proxy should honor LOG_FILE without logging request content', async () => 
                     }
                 ]
             })
-        });
+        }, proxyPort);
 
         assert.ok(receivedBody);
         const logContents = fs.readFileSync(logFile, 'utf8');
         assert.ok(logContents.includes('Request: test'));
         assert.ok(!logContents.includes('super secret prompt contents'));
     } finally {
-        proxy.kill();
+        proxyProc.kill();
+        mock11438.close();
         mockUpstream.close();
         fs.rmSync(logFile, { force: true });
     }
 });
 
-test('Proxy should inject follow-up tool call when agentic response has text but no tool call', async () => {
+runTest('Proxy should inject follow-up tool call when agentic response has text but no tool call', async ({ state, cleanup }) => {
     let upstreamCallCount = 0;
-
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
         let chunks = [];
         req.on('data', chunk => chunks.push(chunk));
@@ -861,14 +972,20 @@ test('Proxy should inject follow-up tool call when agentic response has text but
             res.end();
         });
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/responses',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -903,13 +1020,12 @@ test('Proxy should inject follow-up tool call when agentic response has text but
         assert.ok(outputTypes.includes('message'), 'Expected message in merged output');
         assert.ok(outputTypes.includes('function_call'), 'Expected function_call in merged output');
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should not inject follow-up when response already has a tool call', async () => {
+runTest('Proxy should not inject follow-up when response already has a tool call', async ({ state, cleanup }) => {
     let upstreamCallCount = 0;
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
         let chunks = [];
         req.on('data', chunk => chunks.push(chunk));
@@ -927,14 +1043,20 @@ test('Proxy should not inject follow-up when response already has a tool call', 
             res.end();
         });
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/responses',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -953,13 +1075,12 @@ test('Proxy should not inject follow-up when response already has a tool call', 
 
         assert.strictEqual(upstreamCallCount, 1, 'Should not make follow-up when tool call already present');
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should not inject follow-up when no tools are registered', async () => {
+runTest('Proxy should not inject follow-up when no tools are registered', async ({ state, cleanup }) => {
     let upstreamCallCount = 0;
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
         let chunks = [];
         req.on('data', chunk => chunks.push(chunk));
@@ -980,14 +1101,20 @@ test('Proxy should not inject follow-up when no tools are registered', async () 
             res.end();
         });
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/responses',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -1002,13 +1129,12 @@ test('Proxy should not inject follow-up when no tools are registered', async () 
 
         assert.strictEqual(upstreamCallCount, 1, 'Should not make follow-up when no tools registered');
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });
 
-test('Proxy should not inject follow-up when model replies FINISHED', async () => {
+runTest('Proxy should not inject follow-up when model replies FINISHED', async ({ state, cleanup }) => {
     let upstreamCallCount = 0;
+    const mockPort = await getAvailablePort();
     const mockUpstream = await startMockUpstream((req, res) => {
         let chunks = [];
         req.on('data', chunk => chunks.push(chunk));
@@ -1025,14 +1151,20 @@ test('Proxy should not inject follow-up when model replies FINISHED', async () =
             res.end();
         });
     });
+    state.mockServers.push(mockUpstream.server);
+    const mock11438 = await startMockUpstream((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ object: 'list', models: [{ name: 'test-model' }] }));
+    }, 11438);
+    state.mockServers.push(mock11438.server);
 
-    const proxy = startProxy();
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const { child: proxyProc, proxyPort } = await startProxy({}, undefined, mockPort);
+    state.proxy = proxyProc;
 
     try {
         const req = http.request({
             hostname: 'localhost',
-            port: PROXY_PORT,
+            port: proxyPort,
             path: '/v1/responses',
             method: 'POST',
             headers: { 'Content-Type': 'application/json' }
@@ -1059,7 +1191,5 @@ test('Proxy should not inject follow-up when model replies FINISHED', async () =
         const completed = JSON.parse(completedLine.slice(5));
         assert.ok(!completed.response.output.some(i => i.type === 'function_call'), 'Should not inject FC when FINISHED');
     } finally {
-        proxy.kill();
-        mockUpstream.close();
     }
 });

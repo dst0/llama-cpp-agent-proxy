@@ -4,11 +4,19 @@ import { exec } from "node:child_process";
 
 const TARGET_HOST = process.env.TARGET_HOST || '127.0.0.1';
 const TARGET_PORT = parseInt(process.env.TARGET_PORT || '11435', 10);
+const BACKEND_PORTS = (process.env.BACKEND_PORTS || `${TARGET_PORT}`).split(',').map(p => parseInt(p.trim(), 10));
+const BACKEND_SERVICES = (process.env.BACKEND_SERVICES || 'llama-server').split(',').map(s => s.trim());
 const PROXY_PORT = parseInt(process.env.PORT || '11437', 10);
-const LOG_FILE = process.env.LOG_FILE || 'proxy.log';
-const FULL_LOG_FILE = process.env.FULL_LOG_FILE || 'proxy-full.log';
+const DEFAULT_LOG_DIR = `~/.llama-cpp-agent-proxy/logs/${PROXY_PORT}`.replace('~', process.env.HOME || '');
+const LOG_DIR = (process.env.LOG_DIR || DEFAULT_LOG_DIR).replace('~', process.env.HOME || '');
+const LOG_FILE = (process.env.LOG_FILE || `${LOG_DIR}/proxy.log`).replace('~', process.env.HOME || '');
+const FULL_LOG_FILE = (process.env.FULL_LOG_FILE || `${LOG_DIR}/proxy-full.log`).replace('~', process.env.HOME || '');
 const NON_STOP_MODE = process.env.NON_STOP_MODE === 'true';
+const MONITOR_ENABLED = process.env.MONITOR_ENABLED !== 'false';
 let activeRequests = 0;
+
+// Ensure log directory exists
+try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch (e) {}
 
 const MAX_LOG_SIZE = 32 * 1024 * 1024;
 const MAX_LOG_FILES = 5;
@@ -473,8 +481,50 @@ const server = http.createServer((req, res) => {
     const isModels = req.method === 'GET' && req.url.startsWith('/v1/models');
     const isResponses = req.method === 'POST' && req.url.startsWith('/v1/responses');
 
-    const getTargetPortForModel = (modelName) => {
-        if (modelName === 'qwen2.5-0.5b') return 11438;
+    const getTargetPortForModel = async (modelName) => {
+        if (!modelName) return TARGET_PORT;
+        
+        // Support explicit port in model name for testing/direct access: "some-model:11438"
+        if (modelName.includes(':')) {
+            const parts = modelName.split(':');
+            const port = parseInt(parts[parts.length - 1], 10);
+            if (!isNaN(port)) return port;
+        }
+
+        // Qwen special case (still useful as a default mapping)
+        if (modelName === 'qwen2.5-0.5b' && BACKEND_PORTS.includes(11438)) return 11438;
+
+        // Try to find which backend has this model
+        for (const port of BACKEND_PORTS) {
+            const result = await new Promise((resolve) => {
+                const req = http.request({
+                    hostname: TARGET_HOST,
+                    port: port,
+                    path: '/v1/models',
+                    method: 'GET',
+                    headers: { 'host': `${TARGET_HOST}:${port}` }
+                });
+                req.on('response', (res) => {
+                    let body = '';
+                    res.on('data', c => body += c);
+                    res.on('end', () => {
+                        try {
+                            const json = JSON.parse(body);
+                            if (json.models?.some(m => m.name === modelName || m.slug === modelName)) {
+                                resolve(port);
+                            } else {
+                                resolve(null);
+                            }
+                        } catch { resolve(null); }
+                    });
+                });
+                req.on('error', () => resolve(null));
+                req.setTimeout(200, () => { req.destroy(); resolve(null); });
+                req.end();
+            });
+            if (result) return result;
+        }
+
         return TARGET_PORT;
     };
 
@@ -545,8 +595,7 @@ const server = http.createServer((req, res) => {
     };
 
     if (isModels) {
-        const ports = [TARGET_PORT, 11438];
-        Promise.all(ports.map(port => {
+        Promise.all(BACKEND_PORTS.map(port => {
             return new Promise((resolve) => {
                 const proxyReq = http.request({
                     hostname: TARGET_HOST,
@@ -609,11 +658,11 @@ const server = http.createServer((req, res) => {
     if (isResponses) {
         let bodyChunks = [];
         req.on('data', chunk => bodyChunks.push(chunk));
-        req.on('end', () => {
+        req.on('end', async () => {
             const body = Buffer.concat(bodyChunks).toString();
             try {
                 const json = JSON.parse(body);
-                const targetPort = getTargetPortForModel(json.model);
+                const targetPort = await getTargetPortForModel(json.model);
                 log(`[Proxy] Request: ${json.model} (stream=${!!json.stream}) -> port ${targetPort} non_stop=${NON_STOP_MODE}`);
                 logFull({
                     type: 'request',
@@ -824,13 +873,13 @@ server.listen(PROXY_PORT, "0.0.0.0", () => {
     log(`[llama-cpp-agent-proxy] Listening on 0.0.0.0:${PROXY_PORT} -> ${TARGET_HOST}:${TARGET_PORT}`);
 });
 
-function restartLlamaService(reason) {
-    log(`[Monitor] Restarting llama-server service. Reason: ${reason}`);
-    exec("sudo -n systemctl restart llama-server", (err, stdout, stderr) => {
+function restartLlamaService(serviceName, reason) {
+    log(`[Monitor] Restarting ${serviceName} service. Reason: ${reason}`);
+    exec(`sudo -n systemctl restart ${serviceName}`, (err, stdout, stderr) => {
         if (err) {
-            error(`[Monitor] Failed to restart llama-server: ${err.message}`);
+            error(`[Monitor] Failed to restart ${serviceName}: ${err.message}`);
         } else {
-            log(`[Monitor] llama-server restarted successfully.`);
+            log(`[Monitor] ${serviceName} restarted successfully.`);
         }
     });
 }
@@ -861,60 +910,51 @@ function getGpuMetrics() {
     }
 }
 
-function checkStuckServer() {
-    if (activeRequests > 0) return;
-
-    const metrics = getGpuMetrics();
-    if (!metrics) return;
-
-    if (metrics.busy === 100 && metrics.power < 90) {
-        log(`[Monitor] Stuck detection: GPU ${metrics.busy}% busy, Power ${metrics.power.toFixed(2)}W, Active Requests: ${activeRequests}`);
-        log(`[Monitor] Killing llama-server processes to un-stuck...`);
-        exec("sudo kill -9 $(pgrep -f llama-server)", (err) => {
-            if (err) {
-                // If pgrep fails, maybe no processes found
-                if (err.code === 1) return; 
-                error(`[Monitor] Failed to kill llama-server: ${err.message}`);
-            } else {
-                log(`[Monitor] Killed stuck llama-server processes.`);
-                // systemctl will likely restart it if configured, but let's be sure
-                restartLlamaService('Manual kill of stuck process');
-            }
-        });
-    }
+function checkStuckServer(serviceName) {
+    // Disabled: too aggressive, kills all llama-server instances when one is busy.
+    return;
 }
 
 // 1. Regular liveness ping (once a minute)
-setInterval(() => {
-    checkStuckServer();
+if (MONITOR_ENABLED) {
+    setInterval(() => {
+        for (let i = 0; i < BACKEND_PORTS.length; i++) {
+            const port = BACKEND_PORTS[i];
+            const serviceName = BACKEND_SERVICES[i] || BACKEND_SERVICES[0];
 
-    const options = {
-        hostname: TARGET_HOST,
-        port: TARGET_PORT,
-        path: '/health',
-        method: 'GET',
-        timeout: 10000
-    };
+            if (i === 0) checkStuckServer(serviceName);
 
-    const req = http.request(options, (res) => {
-        if (res.statusCode !== 200) {
-            restartLlamaService(`Upstream /health returned status ${res.statusCode}`);
+            const options = {
+                hostname: TARGET_HOST,
+                port: port,
+                path: '/health',
+                method: 'GET',
+                timeout: 10000
+            };
+
+            const req = http.request(options, (res) => {
+                if (res.statusCode !== 200) {
+                    restartLlamaService(serviceName, `Upstream ${port} /health returned status ${res.statusCode}`);
+                }
+            });
+
+            req.on('error', (err) => {
+                restartLlamaService(serviceName, `Upstream ${port} /health connection error: ${err.message}`);
+            });
+
+            req.on('timeout', () => {
+                req.destroy();
+                restartLlamaService(serviceName, `Upstream ${port} /health timed out`);
+            });
+
+            req.end();
         }
-    });
+    }, 60000);
 
-    req.on('error', (err) => {
-        restartLlamaService(`Upstream /health connection error: ${err.message}`);
-    });
-
-    req.on('timeout', () => {
-        req.destroy();
-        restartLlamaService('Upstream /health timed out');
-    });
-
-    req.end();
-}, 60000);
-
-// 2. Scheduled restart (every 30 minutes)
-setInterval(() => {
-    restartLlamaService('Scheduled 30-minute restart');
-}, 30 * 60 * 1000);
+    // 2. Scheduled restart (every 30 minutes)
+    setInterval(() => {
+        for (const serviceName of BACKEND_SERVICES) {
+            restartLlamaService(serviceName, 'Scheduled 30-minute restart');
+        }
+    }, 30 * 60 * 1000);
+}
