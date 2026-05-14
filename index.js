@@ -813,24 +813,52 @@ const server = http.createServer((req, res) => {
                                     // Proactive Injection for NON_STOP_MODE: 
                                     // If follow-up failed to produce a tool call, and we MUST NOT STOP, synthesize one.
                                     if (injectedItems.length === 0 && NON_STOP_MODE) {
-                                        log(`[Proxy] NON_STOP_MODE: No tool call after follow-up. Proactively injecting 'read_thread_terminal' to keep loop alive.`);
+                                        log(`[Proxy] NON_STOP_MODE: No tool call after follow-up. Proactively injecting thinking + 'read_thread_terminal' to keep loop alive.`);
+                                        
+                                        // 1. Simulate Reasoning
+                                        const rsId = `rs_proxy_${Math.random().toString(36).slice(2, 11)}`;
+                                        const rsText = "hmm.. Let me continue...";
+                                        const rsItem = { 
+                                            type: 'reasoning', 
+                                            id: rsId, 
+                                            content: [{ type: 'reasoning_text', text: rsText }], 
+                                            status: 'completed' 
+                                        };
+                                        
+                                        const rsAddedEvt = { type: 'response.output_item.added', output_index: output.length, item: { type: 'reasoning', id: rsId, status: 'in_progress' } };
+                                        const rsDeltaEvt = { type: 'response.reasoning_text.delta', item_id: rsId, output_index: output.length, delta: rsText };
+                                        const rsDoneEvt = { type: 'response.reasoning_text.done', item_id: rsId, output_index: output.length, text: rsText };
+                                        const rsItemDoneEvt = { type: 'response.output_item.done', output_index: output.length, item: rsItem };
+                                        
+                                        for (const evt of [rsAddedEvt, rsDeltaEvt, rsDoneEvt, rsItemDoneEvt]) {
+                                            logFull({ type: 'sse_proxy', model: json.model, event: evt });
+                                            res.write(`data: ${JSON.stringify(evt)}\n\n`);
+                                        }
+
+                                        // 2. Synthesize Tool Call
                                         const dummyFc = {
                                             type: 'function_call',
                                             id: `fc_proxy_${Math.random().toString(36).slice(2, 11)}`,
                                             name: 'read_thread_terminal',
                                             arguments: '{}'
                                         };
-                                        injectedItems = [dummyFc];
+                                        injectedItems = [rsItem, dummyFc];
                                     }
 
                                     if (injectedItems.length > 0) {
                                         log(`[Proxy] Injecting ${injectedItems.length} item(s) for ${json.model}`);
                                         let outputIndex = output.length;
-                                        for (const fc of injectedItems) {
-                                            const addedEvt = { type: 'response.output_item.added', output_index: outputIndex, item: { type: 'function_call', id: fc.id, call_id: fc.call_id, name: fc.name, arguments: '' } };
-                                            const deltaEvt = { type: 'response.function_call_arguments.delta', item_id: fc.id, output_index: outputIndex, delta: fc.arguments ?? '' };
-                                            const doneArgEvt = { type: 'response.function_call_arguments.done', item_id: fc.id, output_index: outputIndex, arguments: fc.arguments ?? '' };
-                                            const itemDoneEvt = { type: 'response.output_item.done', output_index: outputIndex, item: fc };
+                                        for (const item of injectedItems) {
+                                            // Skip if it was the reasoning item we already manually pushed above
+                                            if (item.type === 'reasoning') {
+                                                outputIndex++;
+                                                continue;
+                                            }
+
+                                            const addedEvt = { type: 'response.output_item.added', output_index: outputIndex, item: { type: 'function_call', id: item.id, call_id: item.call_id, name: item.name, arguments: '' } };
+                                            const deltaEvt = { type: 'response.function_call_arguments.delta', item_id: item.id, output_index: outputIndex, delta: item.arguments ?? '' };
+                                            const doneArgEvt = { type: 'response.function_call_arguments.done', item_id: item.id, output_index: outputIndex, arguments: item.arguments ?? '' };
+                                            const itemDoneEvt = { type: 'response.output_item.done', output_index: outputIndex, item: item };
                                             for (const evt of [addedEvt, deltaEvt, doneArgEvt, itemDoneEvt]) {
                                                 logFull({ type: 'sse_proxy', model: json.model, event: evt });
                                                 res.write(`data: ${JSON.stringify(evt)}\n\n`);
