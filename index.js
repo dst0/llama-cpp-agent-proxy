@@ -798,6 +798,7 @@ const server = http.createServer((req, res) => {
                                 log(`[Proxy] Completed gate for ${json.model}: tools=${hasTools} function_call=${hasFunctionCall} text=${Boolean(textContent)}`);
 
                                 let mergedOutput = output;
+                                let injectedItems = [];
 
                                 if (!hasFunctionCall && hasTools) {
                                     // Follow-up for both empty responses and text-only responses
@@ -807,11 +808,25 @@ const server = http.createServer((req, res) => {
                                         log(`[Proxy] Text-only agentic response for ${json.model}; sending follow-up`);
                                     }
                                     const fcItems = await doFollowUp(json, textContent, targetPort);
+                                    injectedItems = fcItems;
 
-                                    if (fcItems.length > 0) {
-                                        log(`[Proxy] Follow-up injecting ${fcItems.length} function call(s) for ${json.model}`);
+                                    // Proactive Injection for NON_STOP_MODE: 
+                                    // If follow-up failed to produce a tool call, and we MUST NOT STOP, synthesize one.
+                                    if (injectedItems.length === 0 && NON_STOP_MODE) {
+                                        log(`[Proxy] NON_STOP_MODE: No tool call after follow-up. Proactively injecting 'read_thread_terminal' to keep loop alive.`);
+                                        const dummyFc = {
+                                            type: 'function_call',
+                                            id: `fc_proxy_${Math.random().toString(36).slice(2, 11)}`,
+                                            name: 'read_thread_terminal',
+                                            arguments: '{}'
+                                        };
+                                        injectedItems = [dummyFc];
+                                    }
+
+                                    if (injectedItems.length > 0) {
+                                        log(`[Proxy] Injecting ${injectedItems.length} item(s) for ${json.model}`);
                                         let outputIndex = output.length;
-                                        for (const fc of fcItems) {
+                                        for (const fc of injectedItems) {
                                             const addedEvt = { type: 'response.output_item.added', output_index: outputIndex, item: { type: 'function_call', id: fc.id, call_id: fc.call_id, name: fc.name, arguments: '' } };
                                             const deltaEvt = { type: 'response.function_call_arguments.delta', item_id: fc.id, output_index: outputIndex, delta: fc.arguments ?? '' };
                                             const doneArgEvt = { type: 'response.function_call_arguments.done', item_id: fc.id, output_index: outputIndex, arguments: fc.arguments ?? '' };
@@ -822,7 +837,7 @@ const server = http.createServer((req, res) => {
                                             }
                                             outputIndex++;
                                         }
-                                        mergedOutput = [...output, ...fcItems];
+                                        mergedOutput = [...output, ...injectedItems];
                                     }
                                 }
 
