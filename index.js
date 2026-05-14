@@ -330,10 +330,10 @@ function doFollowUp(originalJson, textContent, targetPort) {
                     type: 'input_text',
                     text: textContent
                         ? (NON_STOP_MODE
-                            ? 'You described an action but did not call a tool. If there is remaining work, call the appropriate tool now. If you are still working on the task, perform a next step of work on this task, or plan your actions and call a next tool you need for that. Otherwise continue working on the backlog or live-testing and fixing/polishing the app according to described in documentation flows.'
+                            ? 'You described an action but did not call a tool. Please think about whether you are following the plan correctly and then continue with the next appropriate tool call. Otherwise continue working on the backlog or live-testing and fixing/polishing the app according to described in documentation flows.'
                             : 'You described an action but did not call a tool. If there is remaining work, call the appropriate tool now. If you are still working on the task, perform a next step of work on this task, or plan your actions and call a next tool you need for that. If all work is genuinely complete, respond with only: FINISHED')
                         : (NON_STOP_MODE
-                            ? 'You produced no output. Please reconsider and either call an appropriate tool to continue working on the task, or plan your actions and call a next tool you need for that. Continue working on the backlog or live-testing and fixing/polishing the app according to described in documentation flows.'
+                            ? 'You produced no output. Please think about whether you are following the plan correctly and then call an appropriate tool to continue working on the task. Otherwise continue working on the backlog or live-testing and fixing/polishing the app according to described in documentation flows.'
                             : 'You produced no output. Please reconsider and either call an appropriate tool to continue working on the task, or respond with FINISHED if the task is genuinely complete.')
                 }]
             }
@@ -818,11 +818,11 @@ const server = http.createServer((req, res) => {
                                         // 1. Simulate Reasoning
                                         const rsId = `rs_proxy_${Math.random().toString(36).slice(2, 11)}`;
                                         const variants = [
-                                            "hmm.. Let me continue...",
-                                            "Right, let me keep going...",
-                                            "Continuing with the next steps...",
-                                            "Let me proceed with the task...",
-                                            "I'll continue working on this..."
+                                            "hmm.. Let me check if I'm following the plan correctly and then continue...",
+                                            "Right, let me verify the next steps in my plan and proceed...",
+                                            "Checking adherence to the plan before continuing with the next task...",
+                                            "Ensuring the work aligns with our established plan, let me keep going...",
+                                            "Reviewing the plan progress... everything looks correct, proceeding now..."
                                         ];
                                         const rsText = variants[Math.floor(Math.random() * variants.length)];
                                         const rsItem = { 
