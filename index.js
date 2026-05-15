@@ -13,7 +13,172 @@ const LOG_FILE = (process.env.LOG_FILE || `${LOG_DIR}/proxy.log`).replace('~', p
 const FULL_LOG_FILE = (process.env.FULL_LOG_FILE || `${LOG_DIR}/proxy-full.log`).replace('~', process.env.HOME || '');
 const NON_STOP_MODE = process.env.NON_STOP_MODE === 'true';
 const MONITOR_ENABLED = process.env.MONITOR_ENABLED !== 'false';
+const STATUS_FILE = (process.env.STATUS_FILE || `${LOG_DIR}/proxy.status`).replace('~', process.env.HOME || '');
+const TITLE_MODEL = process.env.TITLE_MODEL || 'qwen2.5-0.5b';
+
+const BUSY_REDIRECT_HOST = process.env.BUSY_REDIRECT_HOST || '192.168.8.124';
+const BUSY_REDIRECT_PORT = parseInt(process.env.BUSY_REDIRECT_PORT || '1234', 10);
+const BUSY_REDIRECT_MODEL = process.env.BUSY_REDIRECT_MODEL || 'qwen3.6-35b-a3b-turboquant-mlx';
+
 let activeRequests = 0;
+const activeRequestsPerPort = new Map();
+let lastTitle = 'Idle';
+let lastTitleText = '';
+let backendStatuses = BACKEND_PORTS.map(port => ({ port, status: 'IDLE' }));
+const modelPortCache = new Map();
+
+function updateStatusFile() {
+    const status = {
+        active_requests: activeRequests,
+        last_title: lastTitle,
+        backends: backendStatuses,
+        timestamp: new Date().toISOString()
+    };
+    try {
+        const tmp = STATUS_FILE + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(status, null, 2));
+        fs.renameSync(tmp, STATUS_FILE);
+    } catch (e) {}
+}
+
+async function generateTitle(inputText) {
+    if (!inputText || activeRequests > 5 || TITLE_MODEL === 'none') return; // Don't overload if busy or disabled
+    
+    try {
+        const targetPort = await getTargetPortForModel(TITLE_MODEL);
+        if (!targetPort) return;
+
+        const prompt = `Summarize the following user request into a very short (max 5 words) title. Return ONLY the title text, no preamble.\n\nRequest: ${inputText.slice(0, 1000)}`;
+        
+        const body = JSON.stringify({
+            model: TITLE_MODEL,
+            input: [{ role: 'user', content: [{ type: 'input_text', text: prompt }] }],
+            stream: false,
+            max_output_tokens: 30,
+            temperature: 0
+        });
+
+        const req = http.request({
+            hostname: TARGET_HOST,
+            port: targetPort,
+            path: '/v1/responses',
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'content-length': Buffer.byteLength(body)
+            }
+        });
+
+        req.on('response', (res) => {
+            let data = '';
+            res.on('data', c => data += c);
+            res.on('end', () => {
+                try {
+                    const json = JSON.parse(data);
+                    const title = json.content?.[0]?.text || json.output?.[0]?.content?.[0]?.text;
+                    if (title) {
+                        lastTitle = title.trim().replace(/^"|"$/g, '').slice(0, 50);
+                        updateStatusFile();
+                    }
+                } catch {}
+            });
+        });
+        req.on('error', () => {});
+        req.setTimeout(5000, () => req.destroy());
+        req.write(body);
+        req.end();
+    } catch {}
+}
+
+const getTargetPortForModel = async (modelName) => {
+    if (!modelName) return TARGET_PORT;
+    
+    // Support explicit port in model name for testing/direct access: "some-model:11438"
+    if (modelName.includes(':')) {
+        const parts = modelName.split(':');
+        const port = parseInt(parts[parts.length - 1], 10);
+        if (!isNaN(port)) return port;
+    }
+
+    if (modelPortCache.has(modelName)) {
+        return modelPortCache.get(modelName);
+    }
+
+    // Qwen special case (still useful as a default mapping)
+    if (modelName === 'qwen2.5-0.5b' && BACKEND_PORTS.includes(11438)) return 11438;
+
+    for (const port of BACKEND_PORTS) {
+        const result = await new Promise((resolve) => {
+            const req = http.request({
+                hostname: TARGET_HOST,
+                port: port,
+                path: '/v1/models',
+                method: 'GET',
+                headers: { 'host': `${TARGET_HOST}:${port}` }
+            });
+            req.on('response', (res) => {
+                let body = '';
+                res.on('data', c => body += c);
+                res.on('end', () => {
+                    try {
+                        if (!body.trim()) return resolve(null);
+                        const json = JSON.parse(body);
+                        const models = json.models || json.data || [];
+                        if (models.some(m => (m.name || m.id) === modelName || m.slug === modelName)) {
+                            resolve(port);
+                        } else {
+                            resolve(null);
+                        }
+                    } catch { resolve(null); }
+                });
+            });
+            req.on('error', () => resolve(null));
+            req.setTimeout(500, () => { req.destroy(); resolve(null); });
+            req.end();
+        });
+        if (result) {
+            modelPortCache.set(modelName, result);
+            return result;
+        }
+
+        // If we get here, the model wasn't found on any configured backend.
+        // Clear any potentially stale cache for this model.
+        modelPortCache.delete(modelName);
+    }
+
+    return TARGET_PORT;
+};
+
+// Helper to fetch server properties dynamically
+const getUpstreamProps = (port = TARGET_PORT) => {
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (value = {}) => {
+            if (settled) return;
+            settled = true;
+            resolve(value);
+        };
+
+        const propsReq = http.get(`http://${TARGET_HOST}:${port}/props`, (propsRes) => {
+            let data = '';
+            propsRes.on('data', c => data += c);
+            propsRes.on('end', () => {
+                try {
+                    finish(JSON.parse(data));
+                } catch {
+                    finish({});
+                }
+            });
+            propsRes.on('error', () => finish({}));
+        });
+
+        propsReq.on('error', () => finish({}));
+        propsReq.setTimeout(500, () => {
+            propsReq.destroy();
+            finish({});
+        });
+    });
+};
 
 // Ensure log directory exists
 try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch (e) {}
@@ -316,36 +481,11 @@ function normalizeInputItem(item) {
  * Returns a promise that resolves with any function_call items extracted from
  * the follow-up response (empty array if the model replied FINISHED or failed).
  */
-function doFollowUp(originalJson, textContent, targetPort) {
+function doRetry(originalJson, targetPort) {
     return new Promise((resolve) => {
-        const followUpInput = [
-            ...(originalJson.input ?? []),
-            {
-                role: 'assistant',
-                content: [{ type: 'output_text', text: textContent }]
-            },
-            {
-                role: 'user',
-                content: [{
-                    type: 'input_text',
-                    text: textContent
-                        ? (NON_STOP_MODE
-                            ? 'You described an action but did not call a tool. Please think about whether you are following the plan correctly and then continue with the next appropriate tool call. Otherwise continue working on the backlog or live-testing and fixing/polishing the app according to described in documentation flows.'
-                            : 'You described an action but did not call a tool. If there is remaining work, call the appropriate tool now. If you are still working on the task, perform a next step of work on this task, or plan your actions and call a next tool you need for that. If all work is genuinely complete, respond with only: FINISHED')
-                        : (NON_STOP_MODE
-                            ? 'You produced no output. Please think about whether you are following the plan correctly and then call an appropriate tool to continue working on the task. Otherwise continue working on the backlog or live-testing and fixing/polishing the app according to described in documentation flows.'
-                            : 'You produced no output. Please reconsider and either call an appropriate tool to continue working on the task, or respond with FINISHED if the task is genuinely complete.')
-                }]
-            }
-        ];
-
-        const followUpBody = JSON.stringify({
-            model: originalJson.model,
-            ...(originalJson.tools ? { tools: originalJson.tools } : {}),
-            ...(originalJson.instructions ? { instructions: originalJson.instructions } : {}),
-            ...(originalJson.temperature !== undefined ? { temperature: originalJson.temperature } : {}),
-            ...(originalJson.max_output_tokens ? { max_output_tokens: originalJson.max_output_tokens } : {}),
-            input: followUpInput,
+        log(`[Proxy] Retrying original prompt for ${originalJson.model}...`);
+        const retryBody = JSON.stringify({
+            ...originalJson,
             stream: true,
         });
 
@@ -357,18 +497,18 @@ function doFollowUp(originalJson, textContent, targetPort) {
             headers: {
                 'content-type': 'application/json',
                 'accept': 'text/event-stream',
-                'content-length': Buffer.byteLength(followUpBody),
+                'content-length': Buffer.byteLength(retryBody),
                 'connection': 'keep-alive'
             }
         });
 
         let buf = '';
         let settled = false;
-        const done = (items) => { if (!settled) { settled = true; resolve(items); } };
+        const done = (result) => { if (!settled) { settled = true; resolve(result); } };
 
-        req.on('response', (followUpRes) => {
-            followUpRes.setEncoding('utf8');
-            followUpRes.on('data', chunk => {
+        req.on('response', (retryRes) => {
+            retryRes.setEncoding('utf8');
+            retryRes.on('data', chunk => {
                 buf += chunk;
                 let bi;
                 while ((bi = buf.indexOf('\n\n')) !== -1) {
@@ -380,30 +520,100 @@ function doFollowUp(originalJson, textContent, targetPort) {
                         if (!payload || payload === '[DONE]') continue;
                         try {
                             const parsed = JSON.parse(payload);
-                            logFull({ type: 'sse_followup', event: parsed });
                             if (parsed.type === 'response.completed') {
                                 const output = parsed.response?.output ?? [];
                                 const fcItems = output.filter(i => i.type === 'function_call');
                                 const msgText = output
                                     .find(i => i.type === 'message')
                                     ?.content?.find(c => c.type === 'output_text')?.text ?? '';
-                                done(/^\s*FINISHED\s*$/i.test(msgText.trim()) ? [] : fcItems);
+                                const isFinished = /^\s*FINISHED\s*$/i.test(msgText.trim());
+                                done({ items: fcItems, finished: isFinished });
                             }
                         } catch {}
                     }
                 }
             });
-            followUpRes.on('end', () => done([]));
+            retryRes.on('end', () => done({ items: [], finished: false }));
+        });
+        req.on('error', () => done({ items: [], finished: false }));
+        req.end(retryBody);
+    });
+}
+
+function doReview(originalJson, textContent, targetPort) {
+    return new Promise((resolve) => {
+        log(`[Proxy] Asking for review for ${originalJson.model}...`);
+        const reviewInput = [
+            ...(originalJson.input ?? []),
+            {
+                role: 'assistant',
+                content: [{ type: 'output_text', text: textContent || '(No output produced)' }]
+            },
+            {
+                role: 'user',
+                content: [{
+                    type: 'input_text',
+                    text: 'Your previous response did not include a tool call, but you have not signaled that the task is FINISHED. Please review your last response and correctly call the next appropriate tool according to your plan. This is a critical check for loop integrity.'
+                }]
+            }
+        ];
+
+        const reviewBody = JSON.stringify({
+            model: originalJson.model,
+            ...(originalJson.tools ? { tools: originalJson.tools } : {}),
+            ...(originalJson.instructions ? { instructions: originalJson.instructions } : {}),
+            input: reviewInput,
+            stream: true,
         });
 
-        req.on('error', (err) => {
-            error(`[Proxy] Follow-up request failed: ${err.message}`);
-            done([]);
+        const req = http.request({
+            hostname: TARGET_HOST,
+            port: targetPort,
+            path: '/v1/responses',
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'accept': 'text/event-stream',
+                'content-length': Buffer.byteLength(reviewBody),
+                'connection': 'keep-alive'
+            }
         });
-        req.setTimeout(120000, () => { req.destroy(); done([]); });
 
-        req.write(followUpBody);
-        req.end();
+        let buf = '';
+        let settled = false;
+        const done = (result) => { if (!settled) { settled = true; resolve(result); } };
+
+        req.on('response', (reviewRes) => {
+            reviewRes.setEncoding('utf8');
+            reviewRes.on('data', chunk => {
+                buf += chunk;
+                let bi;
+                while ((bi = buf.indexOf('\n\n')) !== -1) {
+                    const rawEvent = buf.slice(0, bi);
+                    buf = buf.slice(bi + 2);
+                    for (const line of rawEvent.split('\n')) {
+                        if (!line.startsWith('data:')) continue;
+                        const payload = line.slice(5).trimStart();
+                        if (!payload || payload === '[DONE]') continue;
+                        try {
+                            const parsed = JSON.parse(payload);
+                            if (parsed.type === 'response.completed') {
+                                const output = parsed.response?.output ?? [];
+                                const fcItems = output.filter(i => i.type === 'function_call');
+                                const msgText = output
+                                    .find(i => i.type === 'message')
+                                    ?.content?.find(c => c.type === 'output_text')?.text ?? '';
+                                const isFinished = /^\s*FINISHED\s*$/i.test(msgText.trim());
+                                done({ items: fcItems, finished: isFinished });
+                            }
+                        } catch {}
+                    }
+                }
+            });
+            reviewRes.on('end', () => done({ items: [], finished: false }));
+        });
+        req.on('error', () => done({ items: [], finished: false }));
+        req.end(reviewBody);
     });
 }
 
@@ -468,11 +678,17 @@ function createSseNormalizer(proxyRes, res, { onRawEvent, onNormalizedEvent, onC
 
 const server = http.createServer((req, res) => {
     activeRequests++;
+    updateStatusFile();
+
+    let currentTargetPort = TARGET_PORT;
     let decremented = false;
     const decrement = () => {
         if (!decremented) {
             activeRequests--;
+            const count = activeRequestsPerPort.get(currentTargetPort) || 0;
+            if (count > 0) activeRequestsPerPort.set(currentTargetPort, count - 1);
             decremented = true;
+            updateStatusFile();
         }
     };
     res.on('finish', decrement);
@@ -481,55 +697,7 @@ const server = http.createServer((req, res) => {
     const isModels = req.method === 'GET' && req.url.startsWith('/v1/models');
     const isResponses = req.method === 'POST' && req.url.startsWith('/v1/responses');
 
-    const getTargetPortForModel = async (modelName) => {
-        if (!modelName) return TARGET_PORT;
-        
-        // Support explicit port in model name for testing/direct access: "some-model:11438"
-        if (modelName.includes(':')) {
-            const parts = modelName.split(':');
-            const port = parseInt(parts[parts.length - 1], 10);
-            if (!isNaN(port)) return port;
-        }
-
-        // Qwen special case (still useful as a default mapping)
-        if (modelName === 'qwen2.5-0.5b' && BACKEND_PORTS.includes(11438)) return 11438;
-
-        // Try to find which backend has this model
-        for (const port of BACKEND_PORTS) {
-            const result = await new Promise((resolve) => {
-                const req = http.request({
-                    hostname: TARGET_HOST,
-                    port: port,
-                    path: '/v1/models',
-                    method: 'GET',
-                    headers: { 'host': `${TARGET_HOST}:${port}` }
-                });
-                req.on('response', (res) => {
-                    let body = '';
-                    res.on('data', c => body += c);
-                    res.on('end', () => {
-                        try {
-                            const json = JSON.parse(body);
-                            const models = json.models || json.data || [];
-                            if (models.some(m => (m.name || m.id) === modelName || m.slug === modelName)) {
-                                resolve(port);
-                            } else {
-                                resolve(null);
-                            }
-                        } catch { resolve(null); }
-                    });
-                });
-                req.on('error', () => resolve(null));
-                req.setTimeout(200, () => { req.destroy(); resolve(null); });
-                req.end();
-            });
-            if (result) return result;
-        }
-
-        return TARGET_PORT;
-    };
-
-    const createProxyReq = (options = {}, targetPort = TARGET_PORT) => {
+    const createProxyReq = (options = {}, targetPort = TARGET_PORT, targetHost = TARGET_HOST) => {
         const cleanHeaders = { ...req.headers };
         delete cleanHeaders['host'];
         delete cleanHeaders['content-length'];
@@ -539,13 +707,13 @@ const server = http.createServer((req, res) => {
         const { headers: extraHeaders = {}, ...restOptions } = options;
 
         const proxyReq = http.request({
-            hostname: TARGET_HOST,
+            hostname: targetHost,
             port: targetPort,
             path: req.url,
             method: req.method,
             headers: { 
                 ...cleanHeaders, 
-                'host': `${TARGET_HOST}:${targetPort}`,
+                'host': `${targetHost}:${targetPort}`,
                 'connection': 'keep-alive',
                 ...extraHeaders
             },
@@ -562,37 +730,6 @@ const server = http.createServer((req, res) => {
 
         proxyReq.setTimeout(0);
         return proxyReq;
-    };
-
-    // Helper to fetch server properties dynamically
-    const getUpstreamProps = (port = TARGET_PORT) => {
-        return new Promise((resolve) => {
-            let settled = false;
-            const finish = (value = {}) => {
-                if (settled) return;
-                settled = true;
-                resolve(value);
-            };
-
-            const propsReq = http.get(`http://${TARGET_HOST}:${port}/props`, (propsRes) => {
-                let data = '';
-                propsRes.on('data', c => data += c);
-                propsRes.on('end', () => {
-                    try {
-                        finish(JSON.parse(data));
-                    } catch {
-                        finish({});
-                    }
-                });
-                propsRes.on('error', () => finish({}));
-            });
-
-            propsReq.on('error', () => finish({}));
-            propsReq.setTimeout(500, () => {
-                propsReq.destroy(new Error('Upstream props request timed out'));
-                finish({});
-            });
-        });
     };
 
     if (isModels) {
@@ -620,6 +757,10 @@ const server = http.createServer((req, res) => {
                     });
                 });
                 proxyReq.on('error', () => resolve(null));
+                proxyReq.setTimeout(1000, () => {
+                    proxyReq.destroy();
+                    resolve(null);
+                });
                 proxyReq.end();
             });
         })).then(results => {
@@ -668,12 +809,26 @@ const server = http.createServer((req, res) => {
             const body = Buffer.concat(bodyChunks).toString();
             try {
                 const json = JSON.parse(body);
-                const targetPort = await getTargetPortForModel(json.model);
-                log(`[Proxy] Request: ${json.model} (stream=${!!json.stream}) -> port ${targetPort} non_stop=${NON_STOP_MODE}`);
+                let targetPort = await getTargetPortForModel(json.model);
+                let targetHost = TARGET_HOST;
+
+                // Special Case: Redirect if main llama-server is busy
+                if (targetPort === TARGET_PORT && (activeRequestsPerPort.get(TARGET_PORT) || 0) > 0) {
+                    log(`[Proxy] Main server busy, redirecting to MLX backend: ${BUSY_REDIRECT_HOST}:${BUSY_REDIRECT_PORT}`);
+                    targetPort = BUSY_REDIRECT_PORT;
+                    targetHost = BUSY_REDIRECT_HOST;
+                    json.model = BUSY_REDIRECT_MODEL;
+                }
+
+                currentTargetPort = targetPort;
+                activeRequestsPerPort.set(targetPort, (activeRequestsPerPort.get(targetPort) || 0) + 1);
+                
+                log(`[Proxy] Request: ${json.model} (stream=${!!json.stream}) -> ${targetHost}:${targetPort} non_stop=${NON_STOP_MODE}`);
                 logFull({
                     type: 'request',
                     model: json.model,
                     stream: !!json.stream,
+                    target_host: targetHost,
                     target_port: targetPort,
                     max_output_tokens: json.max_output_tokens,
                     temperature: json.temperature,
@@ -684,6 +839,15 @@ const server = http.createServer((req, res) => {
                 });
 
                 if (Array.isArray(json.input)) {
+                    const lastUserMsg = json.input.filter(m => m.role === 'user').pop();
+                    const text = (Array.isArray(lastUserMsg?.content) 
+                        ? lastUserMsg.content.find(c => c.type === 'input_text' || c.type === 'text')?.text 
+                        : lastUserMsg?.content) || '';
+                    if (text && text !== lastTitleText) {
+                        lastTitleText = text;
+                        generateTitle(text);
+                    }
+                    
                     json.input = json.input.flatMap(item => {
                         return normalizeInputItem(item);
                     }).filter(Boolean).filter(item => !item.content || item.content.length > 0);
@@ -710,7 +874,7 @@ const server = http.createServer((req, res) => {
                 const patchedBody = JSON.stringify(json);
                 const proxyReq = createProxyReq({
                     headers: { 'content-length': Buffer.byteLength(patchedBody) }
-                }, targetPort);
+                }, targetPort, targetHost);
                 
                 proxyReq.on('response', (proxyRes) => {
                     if (!json.stream) {
@@ -801,55 +965,63 @@ const server = http.createServer((req, res) => {
                                 let injectedItems = [];
 
                                 if (!hasFunctionCall && hasTools) {
-                                    // Follow-up for both empty responses and text-only responses
-                                    if (!textContent) {
-                                        log(`[Proxy] Empty agentic response for ${json.model}; sending empty-response follow-up`);
-                                    } else {
-                                        log(`[Proxy] Text-only agentic response for ${json.model}; sending follow-up`);
-                                    }
-                                    const fcItems = await doFollowUp(json, textContent, targetPort);
-                                    injectedItems = fcItems;
+                                    log(`[Proxy] Empty/Text-only response from ${json.model}. Starting multi-stage recovery flow...`);
 
-                                    // Proactive Injection for NON_STOP_MODE: 
-                                    // If follow-up failed to produce a tool call, and we MUST NOT STOP, synthesize one.
-                                    if (injectedItems.length === 0 && NON_STOP_MODE) {
-                                        log(`[Proxy] NON_STOP_MODE: No tool call after follow-up. Proactively injecting thinking + 'exec_command' to keep loop alive.`);
-                                        
-                                        // 1. Simulate Reasoning
-                                        const rsId = `rs_proxy_${Math.random().toString(36).slice(2, 11)}`;
-                                        const variants = [
-                                            "hmm.. Let me check if I'm following the plan correctly and then continue...",
-                                            "Right, let me verify the next steps in my plan and proceed...",
-                                            "Checking adherence to the plan before continuing with the next task...",
-                                            "Ensuring the work aligns with our established plan, let me keep going...",
-                                            "Reviewing the plan progress... everything looks correct, proceeding now..."
-                                        ];
-                                        const rsText = variants[Math.floor(Math.random() * variants.length)];
-                                        const rsItem = { 
-                                            type: 'reasoning', 
-                                            id: rsId, 
-                                            content: [{ type: 'reasoning_text', text: rsText }], 
-                                            status: 'completed' 
-                                        };
-                                        
-                                        const rsAddedEvt = { type: 'response.output_item.added', output_index: output.length, item: { type: 'reasoning', id: rsId, status: 'in_progress' } };
-                                        const rsDeltaEvt = { type: 'response.reasoning_text.delta', item_id: rsId, output_index: output.length, delta: rsText };
-                                        const rsDoneEvt = { type: 'response.reasoning_text.done', item_id: rsId, output_index: output.length, text: rsText };
-                                        const rsItemDoneEvt = { type: 'response.output_item.done', output_index: output.length, item: rsItem };
-                                        
-                                        for (const evt of [rsAddedEvt, rsDeltaEvt, rsDoneEvt, rsItemDoneEvt]) {
-                                            logFull({ type: 'sse_proxy', model: json.model, event: evt });
-                                            res.write(`data: ${JSON.stringify(evt)}\n\n`);
+                                    // 1. Retry original prompt
+                                    const retryRes = await doRetry(json, targetPort);
+                                    injectedItems = retryRes.items;
+
+                                    // 2. Ask model to review (if retry failed and model didn't say FINISHED)
+                                    if (injectedItems.length === 0 && (!retryRes.finished || NON_STOP_MODE)) {
+                                        log(`[Proxy] Retry failed to produce tool call. Asking for review...`);
+                                        const reviewRes = await doReview(json, textContent, targetPort);
+                                        injectedItems = reviewRes.items;
+
+                                        // 3. Proactive Injection (Fake tool call) for NON_STOP_MODE (if review also failed)
+                                        if (injectedItems.length === 0 && (!reviewRes.finished || NON_STOP_MODE) && NON_STOP_MODE) {
+                                            log(`[Proxy] NON_STOP_MODE: Recovery flow failed. Proactively injecting thinking + 'exec_command' to keep loop alive.`);
+                                            
+                                            // 1. Simulate Reasoning
+                                            const rsId = `rs_proxy_${Math.random().toString(36).slice(2, 11)}`;
+                                            const variants = [
+                                                "hmm.. Let me check if I'm following the plan correctly and then continue...",
+                                                "Right, let me verify the next steps in my plan and proceed...",
+                                                "Checking adherence to the plan before continuing with the next task...",
+                                                "Ensuring the work aligns with our established plan, let me keep going...",
+                                                "Reviewing the plan progress... everything looks correct, proceeding now..."
+                                            ];
+                                            const rsText = variants[Math.floor(Math.random() * variants.length)];
+                                            const rsItem = { 
+                                                type: 'reasoning', 
+                                                id: rsId, 
+                                                content: [{ type: 'reasoning_text', text: rsText }], 
+                                                status: 'completed' 
+                                            };
+                                            
+                                            const rsAddedEvt = { type: 'response.output_item.added', output_index: output.length, item: { type: 'reasoning', id: rsId, status: 'in_progress' } };
+                                            const rsDeltaEvt = { type: 'response.reasoning_text.delta', item_id: rsId, output_index: output.length, delta: rsText };
+                                            const rsDoneEvt = { type: 'response.reasoning_text.done', item_id: rsId, output_index: output.length, text: rsText };
+                                            const rsItemDoneEvt = { type: 'response.output_item.done', output_index: output.length, item: rsItem };
+                                            
+                                            for (const evt of [rsAddedEvt, rsDeltaEvt, rsDoneEvt, rsItemDoneEvt]) {
+                                                logFull({ type: 'sse_proxy', model: json.model, event: evt });
+                                                res.write(`data: ${JSON.stringify(evt)}\n\n`);
+                                            }
+
+                                            // 2. Synthesize Tool Call
+                                            const fcId = `fc_proxy_${Math.random().toString(36).slice(2, 11)}`;
+                                            const dummyFc = {
+                                                type: 'function_call',
+                                                id: fcId,
+                                                call_id: fcId,
+                                                name: 'exec_command',
+                                                arguments: JSON.stringify({ 
+                                                    cmd: "ls -F",
+                                                    justification: "Keeping the loop alive in NON_STOP_MODE after recovery flow failed"
+                                                })
+                                            };
+                                            injectedItems = [rsItem, dummyFc];
                                         }
-
-                                        // 2. Synthesize Tool Call
-                                        const dummyFc = {
-                                            type: 'function_call',
-                                            id: `fc_proxy_${Math.random().toString(36).slice(2, 11)}`,
-                                            name: 'exec_command',
-                                            arguments: JSON.stringify({ cmd: "ls -F" })
-                                        };
-                                        injectedItems = [rsItem, dummyFc];
                                     }
 
                                     if (injectedItems.length > 0) {
@@ -931,12 +1103,15 @@ server.listen(PROXY_PORT, "0.0.0.0", () => {
 
 function restartLlamaService(serviceName, reason) {
     log(`[Monitor] Restarting ${serviceName} service. Reason: ${reason}`);
-    exec(`sudo -n systemctl restart ${serviceName}`, (err, stdout, stderr) => {
-        if (err) {
-            error(`[Monitor] Failed to restart ${serviceName}: ${err.message}`);
-        } else {
-            log(`[Monitor] ${serviceName} restarted successfully.`);
-        }
+    // Forcefully kill any existing processes before restarting to prevent "stuck" states
+    exec(`sudo -n pkill -9 -f ${serviceName}`, () => {
+        exec(`sudo -n systemctl restart ${serviceName}`, (err, stdout, stderr) => {
+            if (err) {
+                error(`[Monitor] Failed to restart ${serviceName}: ${err.message}`);
+            } else {
+                log(`[Monitor] ${serviceName} restarted successfully.`);
+            }
+        });
     });
 }
 
@@ -989,17 +1164,28 @@ if (MONITOR_ENABLED) {
             };
 
             const req = http.request(options, (res) => {
+                const portIndex = backendStatuses.findIndex(b => b.port === port);
                 if (res.statusCode !== 200) {
+                    if (portIndex !== -1) backendStatuses[portIndex].status = 'ERROR';
                     restartLlamaService(serviceName, `Upstream ${port} /health returned status ${res.statusCode}`);
+                } else {
+                    if (portIndex !== -1) backendStatuses[portIndex].status = 'READY';
                 }
+                updateStatusFile();
             });
 
             req.on('error', (err) => {
+                const portIndex = backendStatuses.findIndex(b => b.port === port);
+                if (portIndex !== -1) backendStatuses[portIndex].status = 'STOPPED';
+                updateStatusFile();
                 restartLlamaService(serviceName, `Upstream ${port} /health connection error: ${err.message}`);
             });
 
             req.on('timeout', () => {
                 req.destroy();
+                const portIndex = backendStatuses.findIndex(b => b.port === port);
+                if (portIndex !== -1) backendStatuses[portIndex].status = 'STOPPED';
+                updateStatusFile();
                 restartLlamaService(serviceName, `Upstream ${port} /health timed out`);
             });
 

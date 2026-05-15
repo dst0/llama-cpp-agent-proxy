@@ -16,7 +16,10 @@ A high-performance, transparent compatibility bridge between **Codex** (and othe
 
 Run two proxy instances on different ports so different agents can use different behaviors:
 
-- **Port 11451 (Non-Stop Mode)**: Rejects `FINISHED` responses from models. If a model tries to stop without calling a tool, the proxy injects a follow-up prompt encouraging it to continue working on the backlog, live-testing, or polishing the app.
+- **Port 11451 (Non-Stop Mode)**: Rejects `FINISHED` responses from models. If a model tries to stop without calling a tool, the proxy initiates a **multi-stage recovery flow**:
+  1. **Retry**: Resends the original prompt to give the model a second chance.
+  2. **Review**: Asks the model to review its response and explicitly call a tool if work is not finished.
+  3. **Injection**: If all else fails, proactively injects a "fake" tool call (e.g., `ls -F`) with a valid `call_id` and reasoning to keep the agentic loop alive.
 - **Port 11450 (Standard Mode)**: Accepts `FINISHED` responses. Use this for standard agentic workflows.
 
 ### Backend Configuration (GPU & CPU)
