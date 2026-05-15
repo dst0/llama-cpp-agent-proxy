@@ -72,9 +72,19 @@ function startLogWatcher() {
 startLogWatcher();
 
 function updateStatusFile() {
+    // Extract max prefill progress across all backends
+    let prefillProgress = undefined;
+    for (const b of backendStatuses) {
+        if (b.progress !== undefined && b.progress > 0) {
+            if (prefillProgress === undefined || b.progress > prefillProgress) {
+                prefillProgress = b.progress;
+            }
+        }
+    }
     const status = {
         active_requests: activeRequests,
         last_title: lastTitle,
+        prefill_progress: prefillProgress,
         backends: backendStatuses,
         timestamp: new Date().toISOString()
     };
