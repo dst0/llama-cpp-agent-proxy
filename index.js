@@ -977,9 +977,9 @@ const server = http.createServer((req, res) => {
                                         const reviewRes = await doReview(json, textContent, targetPort);
                                         injectedItems = reviewRes.items;
 
-                                        // 3. Proactive Injection (Fake tool call) for NON_STOP_MODE (if review also failed)
-                                        if (injectedItems.length === 0 && (!reviewRes.finished || NON_STOP_MODE) && NON_STOP_MODE) {
-                                            log(`[Proxy] NON_STOP_MODE: Recovery flow failed. Proactively injecting thinking + 'exec_command' to keep loop alive.`);
+                                        // 3. Proactive Injection (Fake tool call) (if review also failed and work not finished)
+                                        if (injectedItems.length === 0 && (!reviewRes.finished || NON_STOP_MODE)) {
+                                            log(`[Proxy] Recovery flow failed. Proactively injecting thinking + 'exec_command' to keep loop alive.`);
                                             
                                             // 1. Simulate Reasoning
                                             const rsId = `rs_proxy_${Math.random().toString(36).slice(2, 11)}`;
