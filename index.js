@@ -32,13 +32,21 @@ const modelPortCache = new Map();
 const PROMPT_PROGRESS_RE = /prompt processing progress,.*?(?:progress\s*=\s*([\d.]+)|([\d.]+)\s*%)/i;
 
 function startLogWatcher() {
-    for (let i = 0; i < BACKEND_SERVICES.length; i++) {
-        const service = BACKEND_SERVICES[i];
+    // Watch stderr log files directly (llama-server writes to files, not journal)
+    const LOG_FILES = (process.env.BACKEND_LOG_FILES || '/opt/llama/logs/main-stderr.log,/opt/llama/logs/micro-stderr.log').split(',').map(f => f.trim());
+    for (let i = 0; i < BACKEND_PORTS.length; i++) {
         const port = BACKEND_PORTS[i];
-        if (!service || !port) continue;
+        const logFile = LOG_FILES[i];
+        if (!port || !logFile) continue;
         
-        const journal = spawn('journalctl', ['-n', '0', '-f', '-u', service]);
-        journal.stdout.on('data', (data) => {
+        const tail = spawn('tail', ['-n', '0', '-f', logFile]);
+        tail.on('error', (err) => {
+            console.error(`[LogWatcher] Failed to spawn tail for ${logFile}:`, err.message);
+        });
+        tail.on('exit', (code) => {
+            console.error(`[LogWatcher] tail for ${logFile} exited with code ${code}`);
+        });
+        tail.stdout.on('data', (data) => {
             const lines = data.toString().split('\n');
             let updated = false;
             for (const line of lines) {
