@@ -71,7 +71,7 @@ Point your agents to the desired proxy:
 
 ## Environment Variables
 
-The proxy supports the following variables (configured automatically by the scripts):
+The proxy supports the following variables (configured automatically by the scripts, or via `.env` file):
 
 - `BACKEND_PORTS` — Comma-separated list of upstream ports (default: `11435,11438`).
 - `BACKEND_SERVICES` — Comma-separated list of systemd service names for monitoring (default: `llama-server-main,lms-micro`).
@@ -81,6 +81,24 @@ The proxy supports the following variables (configured automatically by the scri
 - `LOG_DIR` — Directory for logs (default: `~/.llama-cpp-agent-proxy/logs/<port>`).
 - `LOG_FILE` — Path to concise log file.
 - `FULL_LOG_FILE` — Path to full JSON log file for observability.
+
+### Busy Redirect (MLX Backend Fallback)
+
+When the main llama-server is busy (already handling a request), the proxy can redirect to an MLX backend on a separate machine:
+
+- `BUSY_REDIRECT_HOST` — Host of the MLX redirect server (default: `192.168.8.124`).
+- `BUSY_REDIRECT_PORT` — Port of the MLX redirect server (default: `1234`).
+- `BUSY_REDIRECT_MODEL` — Model name to use on the redirect server (default: `mtplx-qwen36-27b-optimized-speed`).
+- `BUSY_REDIRECT_API_KEY` — Bearer API key for the redirect server (required if the server enforces auth).
+
+### .env File
+
+Copy `.env.example` to `.env` and fill in your values. The proxy reads `.env` automatically on startup (via `dotenv`). The `.env` file is git-ignored to prevent exposing secrets.
+
+```bash
+cp .env.example .env
+# Edit .env with your values, especially BUSY_REDIRECT_API_KEY
+```
 
 ## Observability
 

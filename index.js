@@ -1,6 +1,7 @@
+import 'dotenv/config';
 import http from "node:http";
 import fs from "node:fs";
-import { exec } from "node:child_process";
+import { exec, spawn } from "node:child_process";
 
 const TARGET_HOST = process.env.TARGET_HOST || '127.0.0.1';
 const TARGET_PORT = parseInt(process.env.TARGET_PORT || '11435', 10);
@@ -18,7 +19,8 @@ const TITLE_MODEL = process.env.TITLE_MODEL || 'qwen2.5-0.5b';
 
 const BUSY_REDIRECT_HOST = process.env.BUSY_REDIRECT_HOST || '192.168.8.124';
 const BUSY_REDIRECT_PORT = parseInt(process.env.BUSY_REDIRECT_PORT || '1234', 10);
-const BUSY_REDIRECT_MODEL = process.env.BUSY_REDIRECT_MODEL || 'qwen3.6-35b-a3b-turboquant-mlx';
+const BUSY_REDIRECT_MODEL = process.env.BUSY_REDIRECT_MODEL || 'mtplx-qwen36-27b-optimized-speed';
+const BUSY_REDIRECT_API_KEY = process.env.BUSY_REDIRECT_API_KEY || '';
 
 let activeRequests = 0;
 const activeRequestsPerPort = new Map();
@@ -26,6 +28,48 @@ let lastTitle = 'Idle';
 let lastTitleText = '';
 let backendStatuses = BACKEND_PORTS.map(port => ({ port, status: 'IDLE' }));
 const modelPortCache = new Map();
+
+const PROMPT_PROGRESS_RE = /prompt processing progress,.*?(?:progress\s*=\s*([\d.]+)|([\d.]+)\s*%)/i;
+
+function startLogWatcher() {
+    for (let i = 0; i < BACKEND_SERVICES.length; i++) {
+        const service = BACKEND_SERVICES[i];
+        const port = BACKEND_PORTS[i];
+        if (!service || !port) continue;
+        
+        const journal = spawn('journalctl', ['-n', '0', '-f', '-u', service]);
+        journal.stdout.on('data', (data) => {
+            const lines = data.toString().split('\n');
+            let updated = false;
+            for (const line of lines) {
+                const match = line.match(PROMPT_PROGRESS_RE);
+                if (match) {
+                    const directValue = match[1];
+                    const percentValue = match[2];
+                    const progress = directValue !== undefined 
+                        ? Number.parseFloat(directValue) 
+                        : Number.parseFloat(percentValue) / 100;
+                    
+                    const portIndex = backendStatuses.findIndex(b => b.port === port);
+                    if (portIndex !== -1) {
+                        backendStatuses[portIndex].progress = progress;
+                        updated = true;
+                    }
+                } else if (line.includes('llama_print_timings')) {
+                    const portIndex = backendStatuses.findIndex(b => b.port === port);
+                    if (portIndex !== -1) {
+                        backendStatuses[portIndex].progress = undefined;
+                        updated = true;
+                    }
+                }
+            }
+            if (updated) {
+                updateStatusFile();
+            }
+        });
+    }
+}
+startLogWatcher();
 
 function updateStatusFile() {
     const status = {
@@ -813,11 +857,13 @@ const server = http.createServer((req, res) => {
                 let targetHost = TARGET_HOST;
 
                 // Special Case: Redirect if main llama-server is busy
+                let isRedirect = false;
                 if (targetPort === TARGET_PORT && (activeRequestsPerPort.get(TARGET_PORT) || 0) > 0) {
                     log(`[Proxy] Main server busy, redirecting to MLX backend: ${BUSY_REDIRECT_HOST}:${BUSY_REDIRECT_PORT}`);
                     targetPort = BUSY_REDIRECT_PORT;
                     targetHost = BUSY_REDIRECT_HOST;
                     json.model = BUSY_REDIRECT_MODEL;
+                    isRedirect = true;
                 }
 
                 currentTargetPort = targetPort;
@@ -872,8 +918,11 @@ const server = http.createServer((req, res) => {
                 }
                 
                 const patchedBody = JSON.stringify(json);
+                const redirectHeaders = isRedirect && BUSY_REDIRECT_API_KEY
+                    ? { 'content-length': Buffer.byteLength(patchedBody), 'Authorization': `Bearer ${BUSY_REDIRECT_API_KEY}` }
+                    : { 'content-length': Buffer.byteLength(patchedBody) };
                 const proxyReq = createProxyReq({
-                    headers: { 'content-length': Buffer.byteLength(patchedBody) }
+                    headers: redirectHeaders
                 }, targetPort, targetHost);
                 
                 proxyReq.on('response', (proxyRes) => {
