@@ -794,9 +794,9 @@ LISTEN_PORTS.forEach(port => {
     });
 });
 
-function restartLlamaService(name, reason) {
-    log(`[Monitor] Restarting ${name}: ${reason}`);
-    exec(`sudo -n pkill -9 -f ${name}; sudo -n systemctl restart ${name}`, (err) => {
+function restartLlamaService(name, port, reason) {
+    log(`[Monitor] Restarting ${name} on port ${port}: ${reason}`);
+    exec(`sudo -n pkill -9 -f "port ${port}"; sudo -n systemctl restart ${name}`, (err) => {
         if (!err) log(`[Monitor] ${name} restarted successfully.`);
     });
 }
@@ -815,18 +815,18 @@ if (MONITOR_ENABLED) {
                     } else {
                         b.status = 'ERROR';
                         b.progress = undefined;
-                        restartLlamaService(name, `Health status ${res.statusCode}`);
+                        restartLlamaService(name, port, `Health status ${res.statusCode}`);
                     }
                 }
                 updateStatusFile();
             }).on('error', (err) => {
                 const b = backendStatuses.find(b => b.port === port);
                 if (b) { b.status = 'STOPPED'; b.progress = undefined; updateStatusFile(); }
-                restartLlamaService(name, err.message);
+                restartLlamaService(name, port, err.message);
             }).on('timeout', () => {
                 const b = backendStatuses.find(b => b.port === port);
                 if (b) { b.status = 'STOPPED'; b.progress = undefined; updateStatusFile(); }
-                restartLlamaService(name, 'Health timeout');
+                restartLlamaService(name, port, 'Health timeout');
             });
         });
     };
