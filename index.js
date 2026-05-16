@@ -79,7 +79,7 @@ function startLogWatcher() {
 }
 startLogWatcher();
 
-function updateStatusFile() {
+function getStatus() {
     // Extract max prefill progress across all backends
     let prefillProgress = undefined;
     for (const b of backendStatuses) {
@@ -89,13 +89,17 @@ function updateStatusFile() {
             }
         }
     }
-    const status = {
+    return {
         active_requests: activeRequests,
         last_title: lastTitle,
         prefill_progress: prefillProgress,
         backends: backendStatuses,
         timestamp: new Date().toISOString()
     };
+}
+
+function updateStatusFile() {
+    const status = getStatus();
     try {
         const tmp = STATUS_FILE + '.tmp';
         fs.writeFileSync(tmp, JSON.stringify(status, null, 2));
@@ -758,6 +762,13 @@ const server = http.createServer((req, res) => {
 
     const isModels = req.method === 'GET' && req.url.startsWith('/v1/models');
     const isResponses = req.method === 'POST' && req.url.startsWith('/v1/responses');
+    const isStatus = req.method === 'GET' && req.url === '/v1/status';
+
+    if (isStatus) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(getStatus(), null, 2));
+        return;
+    }
 
     const createProxyReq = (options = {}, targetPort = TARGET_PORT, targetHost = TARGET_HOST) => {
         const cleanHeaders = { ...req.headers };
