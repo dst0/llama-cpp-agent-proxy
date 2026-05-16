@@ -84,7 +84,7 @@ function startLogWatcher() {
         const logFile = LOG_FILES[i];
         if (!port || !logFile) continue;
         
-        const tail = spawn('tail', ['-n', '0', '-f', logFile]);
+        const tail = spawn('tail', ['-n', '0', '-F', logFile]);
         tail.on('error', (err) => {
             console.error(`[LogWatcher] Failed to spawn tail for ${logFile}: `, err.message);
         });
@@ -110,11 +110,28 @@ startLogWatcher();
 
 function getStatus() {
     let prefillProgress = undefined;
-    for (const b of backendStatuses) {
-        if (b.progress !== undefined && b.progress > 0) {
+    const backends = backendStatuses.map(b => {
+        const q = backendQueues.get(b.port);
+        let status = b.status;
+        
+        // Derive detailed status for the "trio" (READY/PREFILL/GEN)
+        if (status === 'READY' || status === 'BUSY' || status === 'IDLE') {
+            if (q && q.active) {
+                if (b.progress !== undefined && b.progress > 0 && b.progress < 1) {
+                    status = 'PREFILL';
+                } else {
+                    status = 'GEN';
+                }
+            } else {
+                status = 'READY';
+            }
+        }
+        
+        if (status !== 'STOPPED' && status !== 'ERROR' && b.progress !== undefined && b.progress > 0) {
             if (prefillProgress === undefined || b.progress > prefillProgress) prefillProgress = b.progress;
         }
-    }
+        return { ...b, status };
+    });
 
     const portsStatus = {};
     LISTEN_PORTS.forEach(p => {
@@ -136,7 +153,7 @@ function getStatus() {
         queues: queuesStatus,
         last_title: lastTitle,
         prefill_progress: prefillProgress,
-        backends: backendStatuses,
+        backends: backends,
         timestamp: new Date().toISOString()
     };
 }
@@ -599,6 +616,8 @@ function createRequestHandler(port, isNonStop) {
             });
             pReq.on('error', (err) => {
                 error(`Upstream Error (${req.method} ${req.url} -> ${tPort}): ${err.message}`);
+                const b = backendStatuses.find(b => b.port === tPort);
+                if (b) { b.status = 'STOPPED'; b.progress = undefined; updateStatusFile(); }
                 if (!res.headersSent) {
                     res.writeHead(502, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ error: "Upstream server unavailable", details: err.message }));
@@ -664,7 +683,12 @@ function createRequestHandler(port, isNonStop) {
                     const queue = backendQueues.get(tPort);
                     if (queue) {
                         log(`[Proxy] Enqueuing request for backend port ${tPort}. Current queue size: ${queue.size}`);
-                        releaseBackend = await queue.acquire();
+                        const release = await queue.acquire();
+                        releaseBackend = () => {
+                            const b = backendStatuses.find(b => b.port === tPort);
+                            if (b) b.progress = undefined;
+                            release();
+                        };
                     }
 
                     log(`[Proxy] Port ${port} Request: ${json.model} -> ${tHost}:${tPort} non_stop=${isNonStop}`);
@@ -768,23 +792,30 @@ function restartLlamaService(name, reason) {
 }
 
 if (MONITOR_ENABLED) {
-    setInterval(() => {
+    const checkBackends = () => {
         BACKEND_PORTS.forEach((port, i) => {
             const name = BACKEND_SERVICES[i] || BACKEND_SERVICES[0];
             http.get({ hostname: TARGET_HOST, port, path: '/health', timeout: 5000 }, (res) => {
                 const b = backendStatuses.find(b => b.port === port);
-                if (b) b.status = res.statusCode === 200 ? 'READY' : 'ERROR';
-                if (res.statusCode !== 200) restartLlamaService(name, `Health status ${res.statusCode}`);
+                if (b) {
+                    b.status = res.statusCode === 200 ? 'READY' : 'ERROR';
+                    if (res.statusCode !== 200) {
+                        b.progress = undefined;
+                        restartLlamaService(name, `Health status ${res.statusCode}`);
+                    }
+                }
                 updateStatusFile();
             }).on('error', (err) => {
                 const b = backendStatuses.find(b => b.port === port);
-                if (b) b.status = 'STOPPED'; updateStatusFile();
+                if (b) { b.status = 'STOPPED'; b.progress = undefined; updateStatusFile(); }
                 restartLlamaService(name, err.message);
             }).on('timeout', () => {
                 const b = backendStatuses.find(b => b.port === port);
-                if (b) b.status = 'STOPPED'; updateStatusFile();
+                if (b) { b.status = 'STOPPED'; b.progress = undefined; updateStatusFile(); }
                 restartLlamaService(name, 'Health timeout');
             });
         });
-    }, 60000);
+    };
+    setInterval(checkBackends, 60000);
+    setTimeout(checkBackends, 1000); // Initial check shortly after startup
 }
