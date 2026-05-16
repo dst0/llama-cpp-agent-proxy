@@ -22,7 +22,7 @@ bash "$SCRIPT_DIR/install-service.sh" \
     --service-name llama-cpp-agent-proxy \
     --port "$PORTS" \
     --monitor-enabled true \
-    --backend-ports "11435,11438" \
+    --backend-ports "11435,1234" \
     --backend-services "llama-server-main,lms-micro"
 
 echo ""
