@@ -796,7 +796,7 @@ LISTEN_PORTS.forEach(port => {
 
 function restartLlamaService(name, reason) {
     log(`[Monitor] Restarting ${name}: ${reason}`);
-    exec(`sudo -n pkill -9 -f ${name} && sudo -n systemctl restart ${name}`, (err) => {
+    exec(`sudo -n pkill -9 -f ${name}; sudo -n systemctl restart ${name}`, (err) => {
         if (!err) log(`[Monitor] ${name} restarted successfully.`);
     });
 }
