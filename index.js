@@ -577,8 +577,7 @@ function createRequestHandler(port, isNonStop) {
         const isMetadata = req.method === 'GET' && (req.url.startsWith('/v1/models') || req.url.startsWith('/v1/props'));
 
         if (!isStatus && !isStatusEvents && !isMetadata) {
-            const current = (activeRequestsPerPort.get(port) || 0) + 1;
-            activeRequestsPerPort.set(port, current);
+            activeRequestsPerPort.set(port, (activeRequestsPerPort.get(port) || 0) + 1);
             updateStatusFile();
         }
 
@@ -587,8 +586,7 @@ function createRequestHandler(port, isNonStop) {
         const cleanup = () => {
             if (!decremented) {
                 if (!isStatus && !isStatusEvents && !isMetadata) {
-                    const current = Math.max(0, (activeRequestsPerPort.get(port) || 0) - 1);
-                    activeRequestsPerPort.set(port, current);
+                    activeRequestsPerPort.set(port, Math.max(0, (activeRequestsPerPort.get(port) || 0) - 1));
                     updateStatusFile();
                 }
                 decremented = true;
@@ -596,6 +594,8 @@ function createRequestHandler(port, isNonStop) {
             }
         };
         res.on('finish', cleanup); res.on('close', cleanup);
+        // Safety timeout: 10 minutes max for any request to prevent count leaks
+        setTimeout(cleanup, 600000);
 
         const isModels = req.method === 'GET' && req.url.startsWith('/v1/models');
         const isResponses = req.method === 'POST' && req.url.startsWith('/v1/responses');
