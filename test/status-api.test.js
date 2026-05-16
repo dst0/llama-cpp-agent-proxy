@@ -70,6 +70,28 @@ test('Proxy /v1/status API endpoint', async (t) => {
         assert.strictEqual(body.backends[0].port, targetPort);
     });
 
+    await t.test('supports SSE status events', async () => {
+        const res = await new Promise((resolve) => {
+            http.get(`http://127.0.0.1:${proxyPort}/v1/status/events`, resolve);
+        });
+
+        assert.strictEqual(res.statusCode, 200);
+        assert.strictEqual(res.headers['content-type'], 'text/event-stream');
+
+        const initialData = await new Promise((resolve) => {
+            res.on('data', (chunk) => {
+                const text = chunk.toString();
+                if (text.startsWith('data: ')) {
+                    resolve(JSON.parse(text.slice(6)));
+                    res.destroy(); // Close after receiving first event
+                }
+            });
+        });
+
+        assert.ok(initialData.timestamp);
+        assert.strictEqual(typeof initialData.active_requests, 'number');
+    });
+
     // Cleanup
     proxy.kill();
     if (fs.existsSync(statusFile)) fs.unlinkSync(statusFile);

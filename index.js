@@ -98,8 +98,22 @@ function getStatus() {
     };
 }
 
+const sseClients = new Set();
+
+function broadcastStatus(status) {
+    const data = `data: ${JSON.stringify(status)}\n\n`;
+    for (const client of sseClients) {
+        try {
+            client.write(data);
+        } catch (e) {
+            sseClients.delete(client);
+        }
+    }
+}
+
 function updateStatusFile() {
     const status = getStatus();
+    broadcastStatus(status);
     try {
         const tmp = STATUS_FILE + '.tmp';
         fs.writeFileSync(tmp, JSON.stringify(status, null, 2));
@@ -763,6 +777,19 @@ const server = http.createServer((req, res) => {
     const isModels = req.method === 'GET' && req.url.startsWith('/v1/models');
     const isResponses = req.method === 'POST' && req.url.startsWith('/v1/responses');
     const isStatus = req.method === 'GET' && req.url === '/v1/status';
+    const isStatusEvents = req.method === 'GET' && req.url === '/v1/status/events';
+
+    if (isStatusEvents) {
+        res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive'
+        });
+        res.write(`data: ${JSON.stringify(getStatus())}\n\n`);
+        sseClients.add(res);
+        req.on('close', () => sseClients.delete(res));
+        return;
+    }
 
     if (isStatus) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
