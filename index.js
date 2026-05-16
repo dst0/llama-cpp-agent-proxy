@@ -572,25 +572,33 @@ function createSseNormalizer(proxyRes, res, { onRawEvent, onNormalizedEvent, onC
 
 function createRequestHandler(port, isNonStop) {
     return (req, res) => {
-        activeRequestsPerPort.set(port, (activeRequestsPerPort.get(port) || 0) + 1);
-        updateStatusFile();
+        const isStatus = req.method === 'GET' && req.url === '/v1/status';
+        const isStatusEvents = req.method === 'GET' && req.url === '/v1/status/events';
+        const isMetadata = req.method === 'GET' && (req.url.startsWith('/v1/models') || req.url.startsWith('/v1/props'));
+
+        if (!isStatus && !isStatusEvents && !isMetadata) {
+            const current = (activeRequestsPerPort.get(port) || 0) + 1;
+            activeRequestsPerPort.set(port, current);
+            updateStatusFile();
+        }
 
         let decremented = false;
         let releaseBackend = null;
         const cleanup = () => {
             if (!decremented) {
-                activeRequestsPerPort.set(port, Math.max(0, (activeRequestsPerPort.get(port) || 0) - 1));
+                if (!isStatus && !isStatusEvents && !isMetadata) {
+                    const current = Math.max(0, (activeRequestsPerPort.get(port) || 0) - 1);
+                    activeRequestsPerPort.set(port, current);
+                    updateStatusFile();
+                }
                 decremented = true;
                 if (releaseBackend) { releaseBackend(); releaseBackend = null; }
-                updateStatusFile();
             }
         };
         res.on('finish', cleanup); res.on('close', cleanup);
 
         const isModels = req.method === 'GET' && req.url.startsWith('/v1/models');
         const isResponses = req.method === 'POST' && req.url.startsWith('/v1/responses');
-        const isStatus = req.method === 'GET' && req.url === '/v1/status';
-        const isStatusEvents = req.method === 'GET' && req.url === '/v1/status/events';
 
         if (isStatusEvents) {
             res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
@@ -598,11 +606,13 @@ function createRequestHandler(port, isNonStop) {
             sseClients.add(res); req.on('close', () => sseClients.delete(res));
             return;
         }
+
         if (isStatus) {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(getStatus(), null, 2));
             return;
         }
+
 
         const createProxyReq = (options = {}, tPort = TARGET_PORT, tHost = TARGET_HOST) => {
             const cleanHeaders = { ...req.headers };
@@ -795,11 +805,15 @@ if (MONITOR_ENABLED) {
     const checkBackends = () => {
         BACKEND_PORTS.forEach((port, i) => {
             const name = BACKEND_SERVICES[i] || BACKEND_SERVICES[0];
-            http.get({ hostname: TARGET_HOST, port, path: '/health', timeout: 5000 }, (res) => {
+            http.get({ hostname: TARGET_HOST, port, path: '/health', timeout: 10000 }, (res) => {
                 const b = backendStatuses.find(b => b.port === port);
                 if (b) {
-                    b.status = res.statusCode === 200 ? 'READY' : 'ERROR';
-                    if (res.statusCode !== 200) {
+                    if (res.statusCode === 200) {
+                        b.status = 'READY';
+                    } else if (res.statusCode === 503) {
+                        b.status = 'LOADING';
+                    } else {
+                        b.status = 'ERROR';
                         b.progress = undefined;
                         restartLlamaService(name, `Health status ${res.statusCode}`);
                     }
