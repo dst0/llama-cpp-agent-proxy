@@ -32,6 +32,8 @@ let lastTitleText = '';
 let redirectServerAvailable = false;
 let activeRedirectRequests = 0;
 const activeRequestsPerPort = new Map();
+const backendHTTPActivity = new Map();
+BACKEND_PORTS.forEach(p => backendHTTPActivity.set(p, { prefilling: 0, generating: 0 }));
 const backendStatuses = BACKEND_PORTS.map(port => ({ port, status: 'IDLE', progress: undefined }));
 const modelPortCache = new Map();
 const sseClients = new Set();
@@ -118,12 +120,11 @@ function getStatus() {
         
         // Derive detailed status for the "trio" (READY/PREFILL/GEN)
         if (status === 'READY' || status === 'BUSY' || status === 'IDLE') {
-            if (q && q.active) {
-                if (b.progress !== undefined && b.progress > 0 && b.progress < 1) {
-                    status = 'PREFILL';
-                } else {
-                    status = 'GEN';
-                }
+            const httpAct = backendHTTPActivity.get(b.port);
+            if (httpAct && httpAct.prefilling > 0) {
+                status = 'PREFILL';
+            } else if (httpAct && httpAct.generating > 0) {
+                status = 'GEN';
             } else {
                 status = 'READY';
             }
@@ -593,11 +594,13 @@ function createRequestHandler(port, isNonStop) {
         let decremented = false;
         let releaseBackend = null;
         let isRedirect = false;
+        let markFinished = () => {};
         let cleanup = () => {
             if (!decremented) {
                 if (!isStatus && !isStatusEvents && !isMetadata) {
                     activeRequestsPerPort.set(port, Math.max(0, (activeRequestsPerPort.get(port) || 0) - 1));
                     if (isRedirect) activeRedirectRequests = Math.max(0, activeRedirectRequests - 1);
+                    markFinished();
                     updateStatusFile();
                 }
                 decremented = true;
@@ -713,6 +716,33 @@ function createRequestHandler(port, isNonStop) {
                         };
                     }
 
+                    const activity = backendHTTPActivity.get(tPort);
+                    let hasStartedGenerating = false;
+                    let hasFinished = false;
+                    if (activity) {
+                        activity.prefilling++;
+                        updateStatusFile();
+                    }
+                    const markGenerating = () => {
+                        if (!hasStartedGenerating && !hasFinished && activity) {
+                            hasStartedGenerating = true;
+                            activity.prefilling = Math.max(0, activity.prefilling - 1);
+                            activity.generating++;
+                            updateStatusFile();
+                        }
+                    };
+                    markFinished = () => {
+                        if (!hasFinished && activity) {
+                            hasFinished = true;
+                            if (hasStartedGenerating) {
+                                activity.generating = Math.max(0, activity.generating - 1);
+                            } else {
+                                activity.prefilling = Math.max(0, activity.prefilling - 1);
+                            }
+                            updateStatusFile();
+                        }
+                    };
+
                     log(`[Proxy] Port ${port} Request: ${json.model} -> ${tHost}:${tPort} non_stop=${isNonStop}`);
                     logFull({ type: 'request', port, model: json.model, stream: !!json.stream, target_host: tHost, target_port: tPort, body: sanitizeForLog(json) });
 
@@ -735,6 +765,7 @@ function createRequestHandler(port, isNonStop) {
                     
                     const pReq = createProxyReq({ headers: extraHeaders }, tPort, tHost);
                     pReq.on('response', (pRes) => {
+                        pRes.on('data', () => markGenerating());
                         if (!json.stream) {
                             let resChunks = []; pRes.on('data', c => resChunks.push(c));
                             pRes.on('end', () => {
