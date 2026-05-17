@@ -29,6 +29,8 @@ const BUSY_REDIRECT_API_KEY = process.env.BUSY_REDIRECT_API_KEY || '';
 
 let lastTitle = 'Idle';
 let lastTitleText = '';
+let redirectServerAvailable = false;
+let activeRedirectRequests = 0;
 const activeRequestsPerPort = new Map();
 const backendStatuses = BACKEND_PORTS.map(port => ({ port, status: 'IDLE', progress: undefined }));
 const modelPortCache = new Map();
@@ -127,7 +129,7 @@ function getStatus() {
             }
         }
         
-        if (status !== 'STOPPED' && status !== 'ERROR' && b.progress !== undefined && b.progress > 0) {
+        if (status === 'PREFILL' && b.progress !== undefined && b.progress > 0) {
             if (prefillProgress === undefined || b.progress > prefillProgress) prefillProgress = b.progress;
         }
         return { ...b, status };
@@ -149,6 +151,13 @@ function getStatus() {
     return {
         active_requests: Array.from(activeRequestsPerPort.values()).reduce((a, b) => a + b, 0),
         queue_size: totalQueueSize,
+        redirect_server: {
+            host: BUSY_REDIRECT_HOST,
+            port: BUSY_REDIRECT_PORT,
+            model: BUSY_REDIRECT_MODEL,
+            available: redirectServerAvailable,
+            active_requests: activeRedirectRequests
+        },
         ports: portsStatus,
         queues: queuesStatus,
         last_title: lastTitle,
@@ -583,10 +592,12 @@ function createRequestHandler(port, isNonStop) {
 
         let decremented = false;
         let releaseBackend = null;
-        const cleanup = () => {
+        let isRedirect = false;
+        let cleanup = () => {
             if (!decremented) {
                 if (!isStatus && !isStatusEvents && !isMetadata) {
                     activeRequestsPerPort.set(port, Math.max(0, (activeRequestsPerPort.get(port) || 0) - 1));
+                    if (isRedirect) activeRedirectRequests = Math.max(0, activeRedirectRequests - 1);
                     updateStatusFile();
                 }
                 decremented = true;
@@ -683,10 +694,11 @@ function createRequestHandler(port, isNonStop) {
                     const json = JSON.parse(Buffer.concat(chunks).toString());
                     let tPort = await getTargetPortForModel(json.model);
                     let tHost = TARGET_HOST;
-                    let isRedirect = false;
-                    if (tPort === TARGET_PORT && (activeRequestsPerPort.get(tPort) || 0) > 1) {
+                    if (tPort === TARGET_PORT && (activeRequestsPerPort.get(tPort) || 0) > 1 && redirectServerAvailable) {
                         log(`[Proxy] Main server busy, redirecting to MLX: ${BUSY_REDIRECT_HOST}`);
                         tPort = BUSY_REDIRECT_PORT; tHost = BUSY_REDIRECT_HOST; json.model = BUSY_REDIRECT_MODEL; isRedirect = true;
+                        activeRedirectRequests++;
+                        updateStatusFile();
                     }
 
                     // Backend Queuing logic
@@ -803,6 +815,17 @@ function restartLlamaService(name, port, reason) {
 
 if (MONITOR_ENABLED) {
     const checkBackends = () => {
+        // Check Redirect Server
+        if (BUSY_REDIRECT_HOST && BUSY_REDIRECT_PORT) {
+            http.get({ hostname: BUSY_REDIRECT_HOST, port: BUSY_REDIRECT_PORT, path: '/v1/models', timeout: 5000 }, (res) => {
+                redirectServerAvailable = (res.statusCode === 200);
+            }).on('error', () => {
+                redirectServerAvailable = false;
+            }).on('timeout', () => {
+                redirectServerAvailable = false;
+            });
+        }
+
         BACKEND_PORTS.forEach((port, i) => {
             const name = BACKEND_SERVICES[i] || BACKEND_SERVICES[0];
             http.get({ hostname: TARGET_HOST, port, path: '/health', timeout: 10000 }, (res) => {
