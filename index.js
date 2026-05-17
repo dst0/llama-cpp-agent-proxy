@@ -828,6 +828,23 @@ if (MONITOR_ENABLED) {
 
         BACKEND_PORTS.forEach((port, i) => {
             const name = BACKEND_SERVICES[i] || BACKEND_SERVICES[0];
+
+            // Fetch model name
+            http.get({ hostname: TARGET_HOST, port, path: '/v1/models', timeout: 5000 }, (res) => {
+                let data = '';
+                res.on('data', c => data += c);
+                res.on('end', () => {
+                    try {
+                        const json = JSON.parse(data);
+                        const models = json.models || json.data || [];
+                        const b = backendStatuses.find(b => b.port === port);
+                        if (b && models.length > 0) {
+                            b.model = models[0].name || models[0].id || models[0].slug;
+                        }
+                    } catch {}
+                });
+            }).on('error', () => {});
+
             http.get({ hostname: TARGET_HOST, port, path: '/health', timeout: 10000 }, (res) => {
                 const b = backendStatuses.find(b => b.port === port);
                 if (b) {
