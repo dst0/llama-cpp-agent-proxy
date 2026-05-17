@@ -3,6 +3,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import { exec, spawn } from 'node:child_process';
 import path from 'node:path';
+import { OFFLINE_MODELS, switchModel } from './model-switcher.js';
 
 const TARGET_HOST = process.env.TARGET_HOST || '127.0.0.1';
 const TARGET_PORT = parseInt(process.env.TARGET_PORT || '11435', 10);
@@ -680,7 +681,22 @@ function createRequestHandler(port, isNonStop) {
                         }
                     }
                 }
+                
+                // Inject offline models
                 if (statusCode === 200) {
+                    const activeModelNames = allModels.map(m => m.name || m.id);
+                    for (const offline of OFFLINE_MODELS) {
+                        if (!activeModelNames.includes(offline.alias)) {
+                            allModels.push({
+                                ...MODEL_TEMPLATE,
+                                id: offline.alias,
+                                name: offline.alias,
+                                slug: offline.alias,
+                                display_name: offline.alias,
+                                capabilities: ["completion"]
+                            });
+                        }
+                    }
                     const b = JSON.stringify({ object: "list", models: allModels });
                     res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(b) }); res.end(b);
                 } else {
@@ -697,23 +713,50 @@ function createRequestHandler(port, isNonStop) {
                     const json = JSON.parse(Buffer.concat(chunks).toString());
                     let tPort = await getTargetPortForModel(json.model);
                     let tHost = TARGET_HOST;
-                    if (tPort === TARGET_PORT && (activeRequestsPerPort.get(tPort) || 0) > 1 && redirectServerAvailable) {
+                    
+                    // Dynamic Model Switching Logic
+                    // Ensure request pauses in queue if a switch is necessary
+                    const isOfflineModel = OFFLINE_MODELS.some(m => m.id === json.model || m.alias === json.model);
+                    if (isOfflineModel || (tPort !== null && backendStatuses.find(b => b.port === tPort)?.model !== json.model)) {
+                        // We will force the request into the main queue (TARGET_PORT) if we need to switch
+                        const switchTargetPort = TARGET_PORT;
+                        tPort = switchTargetPort;
+                        
+                        const queue = backendQueues.get(tPort);
+                        if (queue) {
+                            log(`[Proxy] Model switch required for ${json.model}. Waiting in queue for port ${tPort}...`);
+                            const release = await queue.acquire();
+                            releaseBackend = () => {
+                                const b = backendStatuses.find(b => b.port === tPort);
+                                if (b) b.progress = undefined;
+                                release();
+                            };
+                            
+                            // Once acquired, execute the switch
+                            const switchSuccess = await switchModel(json.model, tPort, log);
+                            if (!switchSuccess) {
+                                error(`[Proxy] Failed to switch to model ${json.model}`);
+                            }
+                        }
+                    } else if (tPort === TARGET_PORT && (activeRequestsPerPort.get(tPort) || 0) > 1 && redirectServerAvailable) {
                         log(`[Proxy] Main server busy, redirecting to MLX: ${BUSY_REDIRECT_HOST}`);
                         tPort = BUSY_REDIRECT_PORT; tHost = BUSY_REDIRECT_HOST; json.model = BUSY_REDIRECT_MODEL; isRedirect = true;
                         activeRedirectRequests++;
                         updateStatusFile();
                     }
 
-                    // Backend Queuing logic
-                    const queue = backendQueues.get(tPort);
-                    if (queue) {
-                        log(`[Proxy] Enqueuing request for backend port ${tPort}. Current queue size: ${queue.size}`);
-                        const release = await queue.acquire();
-                        releaseBackend = () => {
-                            const b = backendStatuses.find(b => b.port === tPort);
-                            if (b) b.progress = undefined;
-                            release();
-                        };
+                    // Standard Backend Queuing logic for non-switching requests
+                    if (!releaseBackend) {
+                        const queue = backendQueues.get(tPort);
+                        if (queue) {
+                            log(`[Proxy] Enqueuing request for backend port ${tPort}. Current queue size: ${queue.size}`);
+                            const release = await queue.acquire();
+                            releaseBackend = () => {
+                                const b = backendStatuses.find(b => b.port === tPort);
+                                if (b) b.progress = undefined;
+                                release();
+                            };
+                        }
                     }
 
                     const activity = backendHTTPActivity.get(tPort);
