@@ -907,10 +907,13 @@ const checkBackends = () => {
     if (rHost && rPort) {
         http.get({ hostname: rHost, port: rPort, path: '/v1/models', timeout: 5000 }, (res) => {
             redirectServerAvailable = (res.statusCode === 200);
+            updateStatusFile();
         }).on('error', () => {
             redirectServerAvailable = false;
+            updateStatusFile();
         }).on('timeout', () => {
             redirectServerAvailable = false;
+            updateStatusFile();
         });
     }
 
