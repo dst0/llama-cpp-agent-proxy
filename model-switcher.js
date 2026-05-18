@@ -35,9 +35,24 @@ export async function switchModel(targetModelId, targetPort, log = console.log) 
         try {
             log(`[ModelSwitcher] Initiating switch to ${targetConfig.id}`);
             
-            let envContent = fs.readFileSync(ENV_FILE, 'utf8');
-            envContent = envContent.replace(/^MODEL=.*$/m, `MODEL=${targetConfig.modelPath}`);
-            envContent = envContent.replace(/^ALIAS=.*$/m, `ALIAS=${targetConfig.alias}`);
+            let envContent = '';
+            try {
+                envContent = fs.readFileSync(ENV_FILE, 'utf8');
+            } catch (e) {
+                log(`[ModelSwitcher] Warning: Could not read ${ENV_FILE}, using empty base.`);
+            }
+
+            const updateOrAdd = (content, key, value) => {
+                const re = new RegExp(`^${key}=.*$`, 'm');
+                if (re.test(content)) {
+                    return content.replace(re, `${key}=${value}`);
+                } else {
+                    return content + (content.endsWith('\n') || content === '' ? '' : '\n') + `${key}=${value}\n`;
+                }
+            };
+
+            envContent = updateOrAdd(envContent, 'MODEL', targetConfig.modelPath);
+            envContent = updateOrAdd(envContent, 'ALIAS', targetConfig.alias);
             
             const tmpPath = '/home/dst/dev/llama-cpp-agent-proxy/env.tmp';
             fs.writeFileSync(tmpPath, envContent);
@@ -45,8 +60,11 @@ export async function switchModel(targetModelId, targetPort, log = console.log) 
             await new Promise((resolve, reject) => {
                 // Ensure mv succeeds before trying to restart. pkill is allowed to "fail" (return 1 if no process found).
                 const cmd = `sudo -n mv ${tmpPath} ${ENV_FILE} && (sudo -n pkill -9 -f "port ${targetPort}" || true) && sudo -n systemctl restart llama-server-main`;
-                exec(cmd, (err) => {
-                    if (err) reject(err);
+                exec(cmd, (err, stdout, stderr) => {
+                    if (err) {
+                        log(`[ModelSwitcher] Command failed. Stdout: ${stdout}, Stderr: ${stderr}`);
+                        reject(err);
+                    }
                     else resolve();
                 });
             });

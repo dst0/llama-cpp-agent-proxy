@@ -49,75 +49,84 @@ const modelPortCache = new Map();
 const sseClients = new Set();
 
 class BackendQueue {
-    constructor(port) {
+    constructor(port, maxParallel = 1) {
         this.port = port;
-        this.active = false;
-        this.queue = [];
+        this.activeCount = 0;
+        this.maxParallel = maxParallel;
+        this.waiting = [];
     }
 
     async acquire() {
-        if (!this.active) {
-            this.active = true;
+        if (this.activeCount < this.maxParallel) {
+            this.activeCount++;
             updateStatusFile();
-            return () => this.release();
+            let released = false;
+            return () => { if (!released) { released = true; this.release(); } };
         }
         return new Promise(resolve => {
-            this.queue.push(resolve);
+            this.waiting.push(resolve);
             updateStatusFile();
         }).then(() => {
-            this.active = true;
-            updateStatusFile();
-            return () => this.release();
+            // resolve() was called, so slot is already passed to us
+            let released = false;
+            return () => { if (!released) { released = true; this.release(); } };
         });
     }
 
     release() {
-        this.active = false;
-        if (this.queue.length > 0) {
-            const next = this.queue.shift();
+        if (this.waiting.length > 0) {
+            const next = this.waiting.shift();
+            // Pass the slot directly to the next waiter
             next();
         } else {
+            this.activeCount = Math.max(0, this.activeCount - 1);
             updateStatusFile();
         }
     }
 
-    get size() {
-        return this.queue.length;
-    }
+    get active() { return this.activeCount > 0; }
+    get size() { return this.waiting.length; }
 }
 
 const backendQueues = new Map();
-BACKEND_PORTS.forEach(p => backendQueues.set(p, new BackendQueue(p)));
+BACKEND_PORTS.forEach(p => {
+    // Standardize on 1 slot per backend due to VRAM constraints
+    const maxParallel = 1;
+    backendQueues.set(p, new BackendQueue(p, maxParallel));
+});
 
-// Virtual "all" model queue: routes to least-loaded backend, parallelism = # backends
+// Virtual "all" model queue: routes to least-loaded backend
 class VirtualQueue {
     constructor(configs) {
         this.configs = configs;
-        this.active = 0;
-        this.maxParallel = configs.length;
-        this.queue = [];
+        this.activeCount = 0;
+        this.maxParallel = configs.reduce((sum, b) => sum + (backendQueues.get(b.port)?.maxParallel || 1), 0);
+        this.waiting = [];
     }
 
     async acquire() {
-        if (this.active < this.maxParallel) {
+        if (this.activeCount < this.maxParallel) {
             const backend = this.pickBackend();
-            this.active++;
+            this.activeCount++;
             updateStatusFile();
             const bq = backendQueues.get(backend.port);
             const release = await bq.acquire();
+            let released = false;
             return {
                 tHost: backend.host,
                 tPort: backend.port,
                 release: () => {
+                    if (released) return;
+                    released = true;
                     release();
-                    this.active--;
+                    this.activeCount--;
                     this.dispatchNext();
                     updateStatusFile();
                 }
             };
         }
         return new Promise(resolve => {
-            this.queue.push(resolve);
+            this.waiting.push(resolve);
             updateStatusFile();
         }).then(() => this.acquire());
     }
@@ -126,7 +135,7 @@ class VirtualQueue {
         let best = null, bestLoad = Infinity;
         for (const b of this.configs) {
             const q = backendQueues.get(b.port);
-            const load = (q ? (q.active ? 1 : 0) + q.size : 0) +
+            const load = (q ? q.activeCount + q.size : 0) +
                         (backendHTTPActivity.get(b.port)?.generating || 0) +
                         (backendHTTPActivity.get(b.port)?.prefilling || 0);
             if (load < bestLoad) { bestLoad = load; best = b; }
@@ -135,13 +144,14 @@ class VirtualQueue {
     }
 
     dispatchNext() {
-        if (this.queue.length > 0) {
-            const next = this.queue.shift();
+        if (this.waiting.length > 0) {
+            const next = this.waiting.shift();
             next();
         }
     }
 
-    get size() { return this.queue.length; }
+    get active() { return this.activeCount > 0; }
+    get size() { return this.waiting.length; }
 }
 
 const virtualQueue = new VirtualQueue(BACKEND_CONFIGS);
@@ -201,7 +211,13 @@ function getStatus() {
         if (status === 'PREFILL' && b.progress !== undefined && b.progress > 0) {
             if (prefillProgress === undefined || b.progress > prefillProgress) prefillProgress = b.progress;
         }
-        return { ...b, status };
+        return { 
+            ...b, 
+            status, 
+            active_count: q?.activeCount || 0,
+            max_parallel: q?.maxParallel || 0,
+            queue_size: q?.size || 0
+        };
     });
 
     const portsStatus = {};
@@ -213,14 +229,25 @@ function getStatus() {
     const queuesStatus = {};
     let totalQueueSize = 0;
     backendQueues.forEach((q, p) => {
-        queuesStatus[p] = { size: q.size, active: q.active };
-        totalQueueSize += q.size;
+        queuesStatus[p] = { 
+            size: q.size, 
+            active: q.active, 
+            active_count: q.activeCount, 
+            max_parallel: q.maxParallel 
+        };
+        if (p !== 'all') totalQueueSize += q.size;
     });
 
     return {
         active_requests: Array.from(activeRequestsPerPort.values()).reduce((a, b) => a + b, 0),
         queue_size: totalQueueSize,
-        virtual_queue: { model: 'all', size: virtualQueue.size, active: virtualQueue.active, max_parallel: virtualQueue.maxParallel },
+        virtual_queue: { 
+            model: 'all', 
+            size: virtualQueue.size, 
+            active: virtualQueue.active, 
+            active_count: virtualQueue.activeCount,
+            max_parallel: virtualQueue.maxParallel 
+        },
         redirect_server: {
             host: BUSY_REDIRECT_HOST,
             port: BUSY_REDIRECT_PORT,
@@ -237,6 +264,9 @@ function getStatus() {
     };
 }
 
+// SSE broadcast interval (5 times per second = 200ms)
+const BROADCAST_INTERVAL = 200;
+
 function broadcastStatus(status) {
     const data = `event: status\ndata: ${JSON.stringify(status)}\n\n`;
     const dead = [];
@@ -245,6 +275,13 @@ function broadcastStatus(status) {
     }
     for (const client of dead) sseClients.delete(client);
 }
+
+// Start 5Hz broadcast timer
+setInterval(() => {
+    if (sseClients.size > 0) {
+        broadcastStatus(getStatus());
+    }
+}, BROADCAST_INTERVAL);
 
 // SSE heartbeat: send comment lines every 15s to prevent proxy idle-timeout kills
 const SSE_HEARTBEAT_INTERVAL = 15000;
@@ -864,9 +901,11 @@ function createRequestHandler(port, isNonStop) {
                                     if (releaseBackend) releaseBackend();
                                     return;
                                 }
+                                // Trigger immediate status refresh after switch
+                                if (typeof checkBackend === 'function') checkBackend(tPort);
                             }
-                        } else if (tPort === TARGET_PORT && (backendQueues.get(tPort)?.active || (backendQueues.get(tPort)?.size || 0) > 0) && redirectServerAvailable) {
-                            log(`[Proxy] Main server busy, redirecting to MLX: ${BUSY_REDIRECT_HOST}`);
+                        } else if (tPort === TARGET_PORT && (backendQueues.get(tPort)?.activeCount >= backendQueues.get(tPort)?.maxParallel) && redirectServerAvailable) {
+                            log(`[Proxy] Main server busy (${backendQueues.get(tPort).activeCount}/${backendQueues.get(tPort).maxParallel}), redirecting to MLX: ${BUSY_REDIRECT_HOST}`);
                             tPort = BUSY_REDIRECT_PORT; tHost = BUSY_REDIRECT_HOST; json.model = BUSY_REDIRECT_MODEL; isRedirect = true;
                             activeRedirectRequests++;
                             updateStatusFile();
@@ -951,7 +990,6 @@ function createRequestHandler(port, isNonStop) {
                             });
                             pRes.on('end', () => {
                                 res.end();
-                                if (releaseBackend) { releaseBackend(); releaseBackend = null; }
                             });
                             return;
                         }
@@ -967,7 +1005,6 @@ function createRequestHandler(port, isNonStop) {
                                     h['content-length'] = Buffer.byteLength(final);
                                     res.writeHead(pRes.statusCode, h); res.end(final);
                                 } catch { res.writeHead(pRes.statusCode, pRes.headers); res.end(data); }
-                                if (releaseBackend) { releaseBackend(); releaseBackend = null; }
                             });
                         } else {
                             res.writeHead(pRes.statusCode, pRes.headers);
@@ -1003,7 +1040,6 @@ function createRequestHandler(port, isNonStop) {
                                     }
                                     const finalEvt = normalizeResponseJson(merged === out ? comp : { ...comp, response: { ...comp.response, output: merged } });
                                     res.write(`data: ${JSON.stringify(finalEvt)}\n\n`); res.end();
-                                    if (releaseBackend) { releaseBackend(); releaseBackend = null; }
                                 }
                             });
                         }
@@ -1034,63 +1070,116 @@ function restartLlamaService(name, port, reason) {
     });
 }
 
-if (MONITOR_ENABLED) {
-    const checkBackends = () => {
-        // Check Redirect Server
-        if (BUSY_REDIRECT_HOST && BUSY_REDIRECT_PORT) {
-            http.get({ hostname: BUSY_REDIRECT_HOST, port: BUSY_REDIRECT_PORT, path: '/v1/models', timeout: 5000 }, (res) => {
-                redirectServerAvailable = (res.statusCode === 200);
-            }).on('error', () => {
-                redirectServerAvailable = false;
-            }).on('timeout', () => {
-                redirectServerAvailable = false;
-            });
+const lastReadyTime = new Map();
+
+const checkBackend = (port) => {
+    const config = BACKEND_CONFIGS.find(b => b.port === port);
+    const name = config?.service || BACKEND_SERVICES[0];
+    if (!config) return;
+
+    // Fetch props for ctx and batch size
+    getUpstreamProps(config).then(props => {
+        const b = backendStatuses.find(b => b.port === port);
+        if (b) {
+            if (props.n_ctx) {
+                b.n_ctx = props.n_ctx;
+                b.ctx = props.n_ctx;
+            }
+            // n_batch might be in different places depending on llama.cpp version
+            const n_batch = props.default_generation_settings?.n_batch || props.n_batch;
+            if (n_batch) {
+                b.n_batch = n_batch;
+                b.batch_size = n_batch;
+            }
+            // Fallback to env if needed (specifically for the main port)
+            if (!b.n_batch && port === 11435) {
+                b.n_batch = 512;
+                b.batch_size = 512;
+            }
+            if (!b.n_ctx && port === 11435) {
+                b.n_ctx = 65536;
+                b.ctx = 65536;
+            }
         }
+    });
 
-        BACKEND_PORTS.forEach((port, i) => {
-            const name = BACKEND_SERVICES[i] || BACKEND_SERVICES[0];
-
-            // Fetch model name
-            http.get({ hostname: TARGET_HOST, port, path: '/v1/models', timeout: 5000 }, (res) => {
-                let data = '';
-                res.on('data', c => data += c);
-                res.on('end', () => {
-                    try {
-                        const json = JSON.parse(data);
-                        const models = json.models || json.data || [];
-                        const b = backendStatuses.find(b => b.port === port);
-                        if (b && models.length > 0) {
-                            b.model = models[0].name || models[0].id || models[0].slug;
-                        }
-                    } catch {}
-                });
-            }).on('error', () => {});
-
-            http.get({ hostname: TARGET_HOST, port, path: '/health', timeout: 10000 }, (res) => {
+    // Fetch model name
+    http.get({ hostname: TARGET_HOST, port, path: '/v1/models', timeout: 5000 }, (res) => {
+        let data = '';
+        res.on('data', c => data += c);
+        res.on('end', () => {
+            try {
+                const json = JSON.parse(data);
+                const models = json.models || json.data || [];
                 const b = backendStatuses.find(b => b.port === port);
-                if (b) {
-                    if (res.statusCode === 200) {
-                        b.status = 'READY';
-                    } else if (res.statusCode === 503) {
-                        b.status = 'LOADING';
-                    } else {
-                        b.status = 'ERROR';
-                        b.progress = undefined;
-                        restartLlamaService(name, port, `Health status ${res.statusCode}`);
-                    }
+                if (b && models.length > 0) {
+                    b.model = models[0].name || models[0].id || models[0].slug;
                 }
-                updateStatusFile();
-            }).on('error', (err) => {
-                const b = backendStatuses.find(b => b.port === port);
-                if (b) { b.status = 'STOPPED'; b.progress = undefined; updateStatusFile(); }
-                restartLlamaService(name, port, err.message);
-            }).on('timeout', () => {
-                const b = backendStatuses.find(b => b.port === port);
-                if (b) { b.status = 'STOPPED'; b.progress = undefined; updateStatusFile(); }
-                restartLlamaService(name, port, 'Health timeout');
-            });
+            } catch {}
         });
-    };
+    }).on('error', () => {});
+
+    http.get({ hostname: TARGET_HOST, port, path: '/health', timeout: 10000 }, (res) => {
+        const b = backendStatuses.find(b => b.port === port);
+        if (b) {
+            if (res.statusCode === 200) {
+                b.status = 'READY';
+                lastReadyTime.set(port, Date.now());
+            } else if (res.statusCode === 503) {
+                b.status = 'LOADING';
+            } else {
+                b.status = 'ERROR';
+                b.progress = undefined;
+                // Only restart if it was ready recently or if it's been in error state for a long time
+                const lastReady = lastReadyTime.get(port) || 0;
+                if (MONITOR_ENABLED && (Date.now() - lastReady > 60000)) {
+                    restartLlamaService(name, port, `Health status ${res.statusCode}`);
+                }
+            }
+        }
+        updateStatusFile();
+    }).on('error', (err) => {
+        const b = backendStatuses.find(b => b.port === port);
+        if (b) { 
+            const wasReady = b.status === 'READY' || b.status === 'LOADING';
+            b.status = 'STOPPED'; 
+            b.progress = undefined; 
+            updateStatusFile(); 
+            
+            // Only auto-restart if it was previously functioning and now crashed, 
+            // or if it has been stopped for more than 2 minutes (startup safety).
+            const lastReady = lastReadyTime.get(port) || 0;
+            const timeSinceReady = Date.now() - lastReady;
+            if (MONITOR_ENABLED && (wasReady || timeSinceReady > 120000)) {
+                restartLlamaService(name, port, err.message);
+            }
+        }
+    }).on('timeout', () => {
+        const b = backendStatuses.find(b => b.port === port);
+        if (b) { b.status = 'STOPPED'; b.progress = undefined; updateStatusFile(); }
+        // Timeout usually means stuck, restart if it was ready
+        if (MONITOR_ENABLED && lastReadyTime.has(port)) {
+            restartLlamaService(name, port, 'Health timeout');
+        }
+    });
+};
+
+const checkBackends = () => {
+    // Check Redirect Server
+    if (BUSY_REDIRECT_HOST && BUSY_REDIRECT_PORT) {
+        http.get({ hostname: BUSY_REDIRECT_HOST, port: BUSY_REDIRECT_PORT, path: '/v1/models', timeout: 5000 }, (res) => {
+            redirectServerAvailable = (res.statusCode === 200);
+        }).on('error', () => {
+            redirectServerAvailable = false;
+        }).on('timeout', () => {
+            redirectServerAvailable = false;
+        });
+    }
+
+    BACKEND_PORTS.forEach(port => checkBackend(port));
+};
+
+if (MONITOR_ENABLED) {
     setInterval(checkBackends, 60000);
     setTimeout(checkBackends, 1000); // Initial check shortly after startup
 }
