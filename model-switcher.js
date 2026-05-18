@@ -43,7 +43,9 @@ export async function switchModel(targetModelId, targetPort, log = console.log) 
             fs.writeFileSync(tmpPath, envContent);
             
             await new Promise((resolve, reject) => {
-                exec(`sudo -n mv ${tmpPath} ${ENV_FILE} && sudo -n pkill -9 -f "port ${targetPort}" ; sudo -n systemctl restart llama-server-main`, (err) => {
+                // Ensure mv succeeds before trying to restart. pkill is allowed to "fail" (return 1 if no process found).
+                const cmd = `sudo -n mv ${tmpPath} ${ENV_FILE} && (sudo -n pkill -9 -f "port ${targetPort}" || true) && sudo -n systemctl restart llama-server-main`;
+                exec(cmd, (err) => {
                     if (err) reject(err);
                     else resolve();
                 });

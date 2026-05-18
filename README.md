@@ -12,12 +12,18 @@ A high-performance, transparent compatibility bridge between **Codex** (and othe
 - **Liveness Monitoring**: Background monitoring for all backends with automatic service restarts if an upstream instance becomes unresponsive or fails health checks.
 - **Network Ready**: Binds to `0.0.0.0` for full LAN accessibility.
 
-## Two Proxy Architecture
+## Unified Two-Port Architecture
 
-Run two proxy instances on different ports so different agents can use different behaviors:
+The proxy runs as a single unified process that manages both ports (Standard and Non-Stop) and all backends. This provides a unified status view and serialized backend queuing.
 
-- **Port 11451 (Non-Stop Mode)**: Rejects `FINISHED` responses from models. Even if a model claims to be done, the proxy forces it to continue.
 - **Port 11450 (Standard Mode)**: Accepts `FINISHED` responses. Use this for standard agentic workflows.
+- **Port 11451 (Non-Stop Mode)**: Rejects `FINISHED` responses from models. Even if a model claims to be done, the proxy forces it to continue.
+
+### Observability & Status
+
+The proxy provides a unified status API and SSE stream:
+- **Status API**: `http://localhost:11450/v1/status` (Returns JSON)
+- **Status SSE**: `http://localhost:11450/v1/status/events` (Live stream of backend and queue states)
 
 ### Loop Integrity (Multi-stage Recovery)
 
@@ -78,9 +84,8 @@ The proxy supports the following variables (configured automatically by the scri
 - `PORT` — Port the proxy listens on (e.g., `11450` or `11451`).
 - `NON_STOP_MODE` — When `true`, enables the "never finished" agentic behavior.
 - `MONITOR_ENABLED` — Enables background liveness monitoring and auto-restarts (default: `true`).
-- `LOG_DIR` — Directory for logs (default: `~/.llama-cpp-agent-proxy/logs/<port>`).
-- `LOG_FILE` — Path to concise log file.
-- `FULL_LOG_FILE` — Path to full JSON log file for observability.
+- `LOG_DIR` — Directory for logs (default: `/home/dst/.llama-cpp-agent-proxy/logs`).
+- `LOG_FILE` — Path to concise log file (default: `proxy.log` in `LOG_DIR`).
 
 ### Busy Redirect (MLX Backend Fallback)
 

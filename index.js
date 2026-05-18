@@ -125,7 +125,8 @@ class VirtualQueue {
     pickBackend() {
         let best = null, bestLoad = Infinity;
         for (const b of this.configs) {
-            const load = (activeRequestsPerPort.get(b.port) || 0) +
+            const q = backendQueues.get(b.port);
+            const load = (q ? (q.active ? 1 : 0) + q.size : 0) +
                         (backendHTTPActivity.get(b.port)?.generating || 0) +
                         (backendHTTPActivity.get(b.port)?.prefilling || 0);
             if (load < bestLoad) { bestLoad = load; best = b; }
@@ -834,33 +835,42 @@ function createRequestHandler(port, isNonStop) {
 
                         // Dynamic Model Switching Logic
                         // Ensure request pauses in queue if a switch is necessary
-                        const isOfflineModel = OFFLINE_MODELS.some(m => m.id === json.model || m.alias === json.model);
-                        if (isOfflineModel || (tPort !== null && backendStatuses.find(b => b.port === tPort)?.model !== json.model)) {
-                        // We will force the request into the main queue (TARGET_PORT) if we need to switch
-                        const switchTargetPort = TARGET_PORT;
-                        tPort = switchTargetPort;
-                        
-                        const queue = backendQueues.get(tPort);
-                        if (queue) {
-                            log(`[Proxy] Model switch required for ${json.model}. Waiting in queue for port ${tPort}...`);
-                            const release = await queue.acquire();
-                            releaseBackend = () => {
-                                const b = backendStatuses.find(b => b.port === tPort);
-                                if (b) b.progress = undefined;
-                                release();
-                            };
+                        const targetOfflineModel = OFFLINE_MODELS.find(m => m.id === json.model || m.alias === json.model);
+                        const currentModel = backendStatuses.find(b => b.port === tPort)?.model;
+                        const needsSwitch = targetOfflineModel && (currentModel !== targetOfflineModel.id && currentModel !== targetOfflineModel.alias);
+
+                        if (needsSwitch) {
+                            // We will force the request into the main queue (TARGET_PORT) if we need to switch
+                            const switchTargetPort = TARGET_PORT;
+                            tPort = switchTargetPort;
                             
-                            // Once acquired, execute the switch
-                            const switchSuccess = await switchModel(json.model, tPort, log);
-                            if (!switchSuccess) {
-                                error(`[Proxy] Failed to switch to model ${json.model}`);
+                            const queue = backendQueues.get(tPort);
+                            if (queue) {
+                                log(`[Proxy] Model switch required for ${json.model}. Waiting in queue for port ${tPort}...`);
+                                const release = await queue.acquire();
+                                releaseBackend = () => {
+                                    const b = backendStatuses.find(b => b.port === tPort);
+                                    if (b) b.progress = undefined;
+                                    release();
+                                };
+                                
+                                // Once acquired, execute the switch
+                                const switchSuccess = await switchModel(json.model, tPort, log);
+                                if (!switchSuccess) {
+                                    error(`[Proxy] Failed to switch to model ${json.model}`);
+                                    // If switch failed, we should probably not proceed with a stale model
+                                    res.writeHead(503, { 'Content-Type': 'application/json' });
+                                    res.end(JSON.stringify({ error: "Model switch failed", model: json.model }));
+                                    if (releaseBackend) releaseBackend();
+                                    return;
+                                }
                             }
+                        } else if (tPort === TARGET_PORT && (backendQueues.get(tPort)?.active || (backendQueues.get(tPort)?.size || 0) > 0) && redirectServerAvailable) {
+                            log(`[Proxy] Main server busy, redirecting to MLX: ${BUSY_REDIRECT_HOST}`);
+                            tPort = BUSY_REDIRECT_PORT; tHost = BUSY_REDIRECT_HOST; json.model = BUSY_REDIRECT_MODEL; isRedirect = true;
+                            activeRedirectRequests++;
+                            updateStatusFile();
                         }
-                    } else if (tPort === TARGET_PORT && (activeRequestsPerPort.get(tPort) || 0) > 1 && redirectServerAvailable) {
-                        log(`[Proxy] Main server busy, redirecting to MLX: ${BUSY_REDIRECT_HOST}`);
-                        tPort = BUSY_REDIRECT_PORT; tHost = BUSY_REDIRECT_HOST; json.model = BUSY_REDIRECT_MODEL; isRedirect = true;
-                        activeRedirectRequests++;
-                        updateStatusFile();
                     }
 
                     // Standard Backend Queuing logic for non-switching requests
@@ -999,7 +1009,6 @@ function createRequestHandler(port, isNonStop) {
                         }
                     });
                     pReq.write(patched); pReq.end();
-                    }
                 } catch (e) { cleanup(); res.writeHead(500); res.end(e.message); }
             });
             return;
