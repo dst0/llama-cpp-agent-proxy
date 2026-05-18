@@ -157,7 +157,7 @@ class VirtualQueue {
 const virtualQueue = new VirtualQueue(BACKEND_CONFIGS);
 backendQueues.set('all', virtualQueue);
 
-const PROMPT_PROGRESS_RE = /prompt processing progress,.*?(?:progress\s*=\s*([\d.]+)|([\d.]+)\s*%)/i;
+const PROMPT_PROGRESS_RE = /prompt processing,.*?(?:progress\s*=\s*([\d.]+)|([\d.]+)\s*%)/i;
 
 function startLogWatcher() {
     const LOG_FILES = BACKEND_LOG_FILES;
@@ -214,6 +214,8 @@ function getStatus() {
         return { 
             ...b, 
             status, 
+            progress: b.progress !== undefined ? b.progress : (status === 'PREFILL' ? 0 : undefined),
+            prefill_percent: b.progress !== undefined ? Math.round(b.progress * 100) : (status === 'PREFILL' ? 0 : undefined),
             active_count: q?.activeCount || 0,
             max_parallel: q?.maxParallel || 0,
             queue_size: q?.size || 0
@@ -1093,8 +1095,8 @@ const checkBackend = (port) => {
             }
             // Fallback to env if needed (specifically for the main port)
             if (!b.n_batch && port === 11435) {
-                b.n_batch = 512;
-                b.batch_size = 512;
+                b.n_batch = 128;
+                b.batch_size = 128;
             }
             if (!b.n_ctx && port === 11435) {
                 b.n_ctx = 65536;
