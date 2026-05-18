@@ -45,6 +45,36 @@ The proxy supports routing to specialized backends:
     - **Execution**: Strict CPU (AVX2) using `--n-gpu-layers 0`.
     - **Optimized**: Fast, low-latency responses for simple tasks.
 
+## Dynamic Configuration
+
+The proxy can be configured via a `config.toml` file located at `~/.llama-cpp-agent-proxy/config.toml`. This file is **automatically reloaded every minute**, allowing you to update redirect targets and monitor settings without restarting the service.
+
+If the file does not exist, the proxy will create it with default values on startup.
+
+### config.toml Example
+
+```toml
+[network]
+target_host = "127.0.0.1"
+target_port = 11435
+ports = [11450, 11451]
+non_stop_ports = [11451]
+
+[backends]
+ports = [11435, 1234]
+services = ["llama-server-main", "lms-micro"]
+monitor_enabled = true
+
+[redirect]
+host = "192.168.8.234"
+port = 1234
+model = "gemma-4-26b-a4b-it-mlx"
+api_key = ""
+
+[logging]
+dir = "/home/dst/.llama-cpp-agent-proxy/logs"
+```
+
 ## Quick Start
 
 ### 1. Install Backend Services

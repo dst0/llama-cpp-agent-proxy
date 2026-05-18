@@ -3,10 +3,124 @@ import http from 'node:http';
 import fs from 'node:fs';
 import { exec, spawn } from 'node:child_process';
 import path from 'node:path';
+import { parse as parseToml } from 'smol-toml';
 import { OFFLINE_MODELS, switchModel } from './model-switcher.js';
 
-const TARGET_HOST = process.env.TARGET_HOST || '127.0.0.1';
-const TARGET_PORT = parseInt(process.env.TARGET_PORT || '11435', 10);
+// --- Initialization sequence ---
+
+// 1. Basic Paths & Static Env
+const CONFIG_PATH = path.join(process.env.HOME || '', '.llama-cpp-agent-proxy', 'config.toml');
+
+// 2. Mutable configuration variables (will be updated by loadConfig)
+let TARGET_HOST = process.env.TARGET_HOST || '127.0.0.1';
+let TARGET_PORT = parseInt(process.env.TARGET_PORT || '11435', 10);
+
+const LISTEN_PORTS = (process.env.PORTS || process.env.PORT || '11450,11451').split(',').map(p => parseInt(p.trim(), 10));
+const NON_STOP_PORTS = (process.env.NON_STOP_PORTS || (process.env.NON_STOP_MODE === 'true' ? process.env.PORT : '11451') || '').split(',').map(p => parseInt(p.trim(), 10)).filter(p => !isNaN(p));
+
+const PROXY_PORT_PRIMARY = LISTEN_PORTS[0] || 11450;
+const DEFAULT_LOG_DIR = `~/.llama-cpp-agent-proxy/logs/${PROXY_PORT_PRIMARY}`.replace('~', process.env.HOME || '');
+const LOG_DIR = (process.env.LOG_DIR || DEFAULT_LOG_DIR).replace('~', process.env.HOME || '');
+const LOG_FILE = (process.env.LOG_FILE || `${LOG_DIR}/proxy.log`).replace('~', process.env.HOME || '');
+const FULL_LOG_FILE = (process.env.FULL_LOG_FILE || `${LOG_DIR}/proxy-full.log`).replace('~', process.env.HOME || '');
+const STATUS_FILE = (process.env.STATUS_FILE || `${LOG_DIR}/proxy.status`).replace('~', process.env.HOME || '');
+const TITLE_MODEL = process.env.TITLE_MODEL || 'qwen2.5-0.5b';
+
+// Global mutable config state
+let configState = {
+    redirect: {
+        host: process.env.BUSY_REDIRECT_HOST || '192.168.8.234',
+        port: parseInt(process.env.BUSY_REDIRECT_PORT || '1234'),
+        model: process.env.BUSY_REDIRECT_MODEL || 'gemma-4-26b-a4b-it-mlx',
+        api_key: process.env.BUSY_REDIRECT_API_KEY || ''
+    },
+    backends: {
+        monitor_enabled: process.env.MONITOR_ENABLED !== 'false'
+    }
+};
+
+// 3. Logger setup (needs LOG_FILE initialized)
+function writeLog(filePath, line) {
+    const ts = new Date().toISOString();
+    const formatted = `[${ts}] ${line}\n`;
+    try {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.appendFileSync(filePath, formatted);
+    } catch (e) {
+        console.error(`[Logger] Failed to write to ${filePath}: ${e.message}`);
+    }
+}
+function log(msg) { console.log(msg); writeLog(LOG_FILE, msg); }
+function error(msg) { console.error(msg); writeLog(LOG_FILE, `ERROR: ${msg}`); }
+
+// 4. Configuration Loader
+function loadConfig() {
+    try {
+        if (!fs.existsSync(CONFIG_PATH)) {
+            const defaultConfig = {
+                network: {
+                    target_host: TARGET_HOST,
+                    target_port: TARGET_PORT,
+                    ports: LISTEN_PORTS,
+                    non_stop_ports: NON_STOP_PORTS
+                },
+                backends: {
+                    ports: [11435, 1234],
+                    services: ["llama-server-main", "lms-micro"],
+                    monitor_enabled: configState.backends.monitor_enabled
+                },
+                redirect: configState.redirect,
+                logging: {
+                    dir: LOG_DIR
+                }
+            };
+            const tomlStr = `# llama-cpp-agent-proxy configuration\n\n` + 
+                `[network]\ntarget_host = "${defaultConfig.network.target_host}"\ntarget_port = ${defaultConfig.network.target_port}\nports = ${JSON.stringify(defaultConfig.network.ports)}\nnon_stop_ports = ${JSON.stringify(defaultConfig.network.non_stop_ports)}\n\n` +
+                `[backends]\nports = ${JSON.stringify(defaultConfig.backends.ports)}\nservices = ${JSON.stringify(defaultConfig.backends.services)}\nmonitor_enabled = ${defaultConfig.backends.monitor_enabled}\n\n` +
+                `[redirect]\nhost = "${defaultConfig.redirect.host}"\nport = ${defaultConfig.redirect.port}\nmodel = "${defaultConfig.redirect.model}"\napi_key = "${defaultConfig.redirect.api_key}"\n\n` +
+                `[logging]\ndir = "${defaultConfig.logging.dir}"\n`;
+            
+            fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
+            fs.writeFileSync(CONFIG_PATH, tomlStr);
+            log(`[Config] Created default configuration at ${CONFIG_PATH}`);
+        }
+
+        const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
+        const parsed = parseToml(raw);
+        
+        // Update mutable parts of config
+        if (parsed.network) {
+            TARGET_HOST = parsed.network.target_host || TARGET_HOST;
+            TARGET_PORT = parsed.network.target_port || TARGET_PORT;
+        }
+        if (parsed.redirect) {
+            configState.redirect.host = parsed.redirect.host || configState.redirect.host;
+            configState.redirect.port = parsed.redirect.port || configState.redirect.port;
+            configState.redirect.model = parsed.redirect.model || configState.redirect.model;
+            configState.redirect.api_key = parsed.redirect.api_key || configState.redirect.api_key;
+        }
+        if (parsed.backends && typeof parsed.backends.monitor_enabled === 'boolean') {
+            configState.backends.monitor_enabled = parsed.backends.monitor_enabled;
+        }
+        
+        log(`[Config] Loaded configuration from ${CONFIG_PATH}`);
+    } catch (e) {
+        error(`[Config] Failed to load config: ${e.message}`);
+    }
+}
+
+// Initial load
+loadConfig();
+
+// Reload every minute
+setInterval(loadConfig, 60000);
+
+// Use configState for derived values
+const getBusyRedirectHost = () => configState.redirect.host;
+const getBusyRedirectPort = () => configState.redirect.port;
+const getBusyRedirectModel = () => configState.redirect.model;
+const getBusyRedirectApiKey = () => configState.redirect.api_key;
+const isMonitorEnabled = () => configState.backends.monitor_enabled;
 
 // Backend config: host:port:service:logFile (logFile optional)
 const BACKEND_CONFIGS = (process.env.BACKEND_CONFIGS || `${TARGET_HOST}:${TARGET_PORT}:llama-server:/opt/llama/logs/main-stderr.log`).split(',').map(entry => {
@@ -18,24 +132,6 @@ const BACKEND_CONFIGS = (process.env.BACKEND_CONFIGS || `${TARGET_HOST}:${TARGET
 const BACKEND_PORTS = BACKEND_CONFIGS.map(b => b.port);
 const BACKEND_SERVICES = BACKEND_CONFIGS.map(b => b.service);
 const BACKEND_LOG_FILES = BACKEND_CONFIGS.map(b => b.logFile || '');
-
-// Standard ports for Two-Port Proxy Architecture
-const LISTEN_PORTS = (process.env.PORTS || process.env.PORT || '11450,11451').split(',').map(p => parseInt(p.trim(), 10));
-const NON_STOP_PORTS = (process.env.NON_STOP_PORTS || (process.env.NON_STOP_MODE === 'true' ? process.env.PORT : '11451') || '').split(',').map(p => parseInt(p.trim(), 10)).filter(p => !isNaN(p));
-
-const PROXY_PORT_PRIMARY = LISTEN_PORTS[0] || 11450;
-const DEFAULT_LOG_DIR = `~/.llama-cpp-agent-proxy/logs/${PROXY_PORT_PRIMARY}`.replace('~', process.env.HOME || '');
-const LOG_DIR = (process.env.LOG_DIR || DEFAULT_LOG_DIR).replace('~', process.env.HOME || '');
-const LOG_FILE = (process.env.LOG_FILE || `${LOG_DIR}/proxy.log`).replace('~', process.env.HOME || '');
-const FULL_LOG_FILE = (process.env.FULL_LOG_FILE || `${LOG_DIR}/proxy-full.log`).replace('~', process.env.HOME || '');
-const MONITOR_ENABLED = process.env.MONITOR_ENABLED !== 'false';
-const STATUS_FILE = (process.env.STATUS_FILE || `${LOG_DIR}/proxy.status`).replace('~', process.env.HOME || '');
-const TITLE_MODEL = process.env.TITLE_MODEL || 'qwen2.5-0.5b';
-
-const BUSY_REDIRECT_HOST = process.env.BUSY_REDIRECT_HOST || '192.168.8.234';
-const BUSY_REDIRECT_PORT = parseInt(process.env.BUSY_REDIRECT_PORT || '1234');
-const BUSY_REDIRECT_MODEL = process.env.BUSY_REDIRECT_MODEL || 'gemma-4-26b-a4b-it-mlx';
-const BUSY_REDIRECT_API_KEY = process.env.BUSY_REDIRECT_API_KEY || '';
 
 let lastTitle = 'Idle';
 let lastTitleText = '';
@@ -165,7 +261,7 @@ function startLogWatcher() {
         const port = BACKEND_CONFIGS[i].port;
         const logFile = LOG_FILES[i];
         if (!port || !logFile) continue;
-        
+
         const tail = spawn('tail', ['-n', '0', '-F', logFile]);
         tail.on('error', (err) => {
             console.error(`[LogWatcher] Failed to spawn tail for ${logFile}: `, err.message);
@@ -251,9 +347,9 @@ function getStatus() {
             max_parallel: virtualQueue.maxParallel 
         },
         redirect_server: {
-            host: BUSY_REDIRECT_HOST,
-            port: BUSY_REDIRECT_PORT,
-            model: BUSY_REDIRECT_MODEL,
+            host: getBusyRedirectHost(),
+            port: getBusyRedirectPort(),
+            model: getBusyRedirectModel(),
             available: redirectServerAvailable,
             active_requests: activeRedirectRequests
         },
@@ -291,424 +387,123 @@ let sseHeartbeatTimer = null;
 function startSseHeartbeat() {
     if (sseHeartbeatTimer) return;
     sseHeartbeatTimer = setInterval(() => {
-        const dead = [];
+        const data = ': heartbeat\n\n';
         for (const client of sseClients) {
-            try { client.write(':heartbeat\n\n'); } catch (e) { dead.push(client); }
+            try { client.write(data); } catch (e) {}
         }
-        for (const client of dead) sseClients.delete(client);
-        if (sseClients.size === 0) stopSseHeartbeat();
     }, SSE_HEARTBEAT_INTERVAL);
 }
 function stopSseHeartbeat() {
-    if (sseHeartbeatTimer) { clearInterval(sseHeartbeatTimer); sseHeartbeatTimer = null; }
+    if (sseHeartbeatTimer) {
+        clearInterval(sseHeartbeatTimer);
+        sseHeartbeatTimer = null;
+    }
 }
 
 function updateStatusFile() {
-    const status = getStatus();
-    broadcastStatus(status);
     try {
-        const tmp = STATUS_FILE + '.tmp';
-        fs.writeFileSync(tmp, JSON.stringify(status, null, 2));
-        fs.renameSync(tmp, STATUS_FILE);
-    } catch (e) {}
-}
-
-async function generateTitle(inputText) {
-    if (!inputText || TITLE_MODEL === 'none') return;
-    
-    try {
-        const targetPort = await getTargetPortForModel(TITLE_MODEL);
-        if (!targetPort) return;
-
-        const prompt = `Summarize the following user request into a very short (max 5 words) title. Return ONLY the title text, no preamble.\n\nRequest: ${inputText.slice(0, 1000)}`;
-        
-        const body = JSON.stringify({
-            model: TITLE_MODEL,
-            input: [{ role: 'user', content: [{ type: 'input_text', text: prompt }] }],
-            stream: false,
-            max_output_tokens: 30,
-            temperature: 0
-        });
-
-        const req = http.request({
-            hostname: TARGET_HOST,
-            port: targetPort,
-            path: '/v1/responses',
-            method: 'POST',
-            headers: {
-                'content-type': 'application/json',
-                'content-length': Buffer.byteLength(body)
-            }
-        });
-
-        req.on('response', (res) => {
-            let data = '';
-            res.on('data', c => data += c);
-            res.on('end', () => {
-                try {
-                    const json = JSON.parse(data);
-                    const title = json.content?.[0]?.text || json.output?.[0]?.content?.[0]?.text;
-                    if (title) {
-                        lastTitle = title.trim().replace(/^"|"$/g, '').slice(0, 50);
-                        updateStatusFile();
-                    }
-                } catch {}
-            });
-        });
-        req.on('error', () => {});
-        req.setTimeout(5000, () => req.destroy());
-        req.write(body);
-        req.end();
+        fs.writeFileSync(STATUS_FILE, JSON.stringify(getStatus(), null, 2));
     } catch {}
 }
 
-const getTargetPortForModel = async (modelName) => {
-    if (!modelName) return TARGET_PORT;
-    if (modelName === 'all') return null; // Virtual model — handled separately
-    if (modelName.includes(':')) {
-        const parts = modelName.split(':');
-        const port = parseInt(parts[parts.length - 1], 10);
-        if (!isNaN(port)) return port;
-    }
-    if (modelPortCache.has(modelName)) return modelPortCache.get(modelName);
-    if (modelName === 'qwen2.5-0.5b' && BACKEND_PORTS.includes(11438)) return 11438;
-
-    for (const config of BACKEND_CONFIGS) {
-        const result = await new Promise((resolve) => {
-            const req = http.request({
-                hostname: config.host, port: config.port, path: '/v1/models', method: 'GET',
-                headers: { 'host': `${config.host}:${config.port}` }
-            });
-            req.on('response', (res) => {
-                let body = '';
-                res.on('data', c => body += c);
-                res.on('end', () => {
-                    try {
-                        if (!body.trim()) return resolve(null);
-                        const json = JSON.parse(body);
-                        const models = json.models || json.data || [];
-                        if (models.some(m => (m.name || m.id) === modelName || m.slug === modelName)) resolve(port);
-                        else resolve(null);
-                    } catch { resolve(null); }
-                });
-            });
-            req.on('error', () => resolve(null));
-            req.setTimeout(500, () => { req.destroy(); resolve(null); });
-            req.end();
-        });
-        if (result) {
-            modelPortCache.set(modelName, result);
-            return result;
-        }
-    }
-    return TARGET_PORT;
-};
-
-const getUpstreamProps = (config) => {
-    const host = config?.host || TARGET_HOST;
-    const port = config?.port || TARGET_PORT;
-    return new Promise((resolve) => {
-        let settled = false;
-        const finish = (value = {}) => { if (!settled) { settled = true; resolve(value); } };
-        const propsReq = http.get(`http://${host}:${port}/props`, (propsRes) => {
-            let data = '';
-            propsRes.on('data', c => data += c);
-            propsRes.on('end', () => { try { finish(JSON.parse(data)); } catch { finish({}); } });
-            propsRes.on('error', () => finish({}));
-        });
-        propsReq.on('error', () => finish({}));
-        propsReq.setTimeout(500, () => { propsReq.destroy(); finish({}); });
-    });
-};
-
-try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch (e) {}
-const MAX_LOG_SIZE = 32 * 1024 * 1024;
-const MAX_LOG_FILES = 5;
-
-function rotateLog(filePath) {
-    if (!fs.existsSync(filePath)) return;
-    try {
-        const stats = fs.statSync(filePath);
-        if (stats.size < MAX_LOG_SIZE) return;
-        for (let i = MAX_LOG_FILES - 1; i >= 1; i--) {
-            const oldPath = `${filePath}.${i}`;
-            const newPath = `${filePath}.${i + 1}`;
-            if (fs.existsSync(oldPath)) fs.renameSync(oldPath, newPath);
-        }
-        fs.renameSync(filePath, `${filePath}.1`);
-    } catch (e) {}
-}
-
-function writeLog(filePath, line) {
-    try { rotateLog(filePath); fs.appendFileSync(filePath, line + "\n"); } catch (e) {}
-}
-
-function log(msg) {
-    const line = `[${new Date().toISOString()}] ${msg}`;
-    writeLog(LOG_FILE, line);
-    console.log(line);
-}
-
-function error(msg) {
-    const line = `[${new Date().toISOString()}] ERROR: ${msg}`;
-    writeLog(LOG_FILE, line);
-    console.error(line);
-}
-
-function sanitizeForLog(val, depth = 0) {
-    if (depth > 10) return '[...]';
-    if (typeof val === 'string') {
-        if (val.startsWith('data:') && val.includes(';base64,')) {
-            const prefix = val.slice(0, val.indexOf(';base64,') + 8);
-            return `${prefix}[base64 ~${Math.round((val.length - prefix.length) * 3 / 4)} bytes]`;
-        }
-        if (val.length > 200 && /^[A-Za-z0-9+/]{100,}={0,2}$/.test(val)) return `[base64 ~${Math.round(val.length * 3 / 4)} bytes]`;
-        if (val.length > 2000) return val.slice(0, 1000) + ` ...[+${val.length - 1000} chars]`;
-        return val;
-    }
-    if (Array.isArray(val)) return val.map(v => sanitizeForLog(v, depth + 1));
-    if (val && typeof val === 'object') {
-        const out = {};
-        for (const [k, v] of Object.entries(val)) out[k] = sanitizeForLog(v, depth + 1);
-        return out;
-    }
-    return val;
-}
-
-function logFull(entry) {
-    writeLog(FULL_LOG_FILE, JSON.stringify({ ts: new Date().toISOString(), ...entry }));
-}
-
 const MODEL_TEMPLATE = {
-    "slug": "local-model", "display_name": "Local Model", "description": "Local LLM via llama.cpp",
-    "default_reasoning_level": "medium",
-    "supported_reasoning_levels": [
-        { "effort": "none", "description": "Minimal reasoning" },
-        { "effort": "low", "description": "Low reasoning" },
-        { "effort": "medium", "description": "Medium reasoning" },
-        { "effort": "high", "description": "High reasoning" },
-        { "effort": "xhigh", "description": "Extra high reasoning" }
-    ],
-    "supports_reasoning_summaries": true, "support_verbosity": true, "shell_type": "shell_command",
-    "visibility": "list", "supported_in_api": true, "capabilities": ["completion"],
-    "priority": 0, "max_context_window": 65536, "base_instructions": "", "instructions_variables": {},
-    "additional_speed_tiers": ["fast"], "service_tiers": [{ "id": "priority", "name": "Fast", "description": "Local priority" }],
-    "truncation_policy": { "type": "auto" }
+    id: "llama-server",
+    object: "model",
+    created: Math.floor(Date.now() / 1000),
+    owned_by: "llama.cpp",
+    capabilities: ["completion"]
 };
 
-function normalizeContentPart(part, role = 'user') {
-    if (!part || typeof part !== 'object') return part;
-    const imageUrl = typeof part.image_url === 'object' ? part.image_url?.url : part.image_url;
-    const isAssistant = role === 'assistant';
-    const isTextPart = part.type === 'text' || part.type === 'input_text' || part.type === 'output_text' || !part.type;
-    if (part.type === 'image_url' || part.type === 'input_image' || (part.type === 'image' && part.image_url !== undefined) || part.image_url !== undefined) {
-        part.type = 'input_image';
-        if (typeof imageUrl === 'string') part.image_url = imageUrl;
-    } else if (part.type === 'refusal') return part;
-    else if (isAssistant) {
-        if (isTextPart) part.type = 'output_text';
-        else return null;
-    } else if (isTextPart) part.type = 'input_text';
-    else return null;
-    return part;
+async function getUpstreamProps(config) {
+    return new Promise((resolve) => {
+        const req = http.request({ hostname: config.host, port: config.port, path: '/props', method: 'GET', timeout: 2000 }, (res) => {
+            let data = ''; res.on('data', (c) => data += c);
+            res.on('end', () => {
+                try { resolve(JSON.parse(data)); } catch { resolve({}); }
+            });
+        });
+        req.on('error', () => resolve({}));
+        req.on('timeout', () => { req.destroy(); resolve({}); });
+        req.end();
+    });
 }
 
-function normalizeToolOutput(output) {
-    if (typeof output === 'string') return [{ type: 'input_text', text: output }];
-    if (!Array.isArray(output)) return output;
-    return output.map(part => {
-        if (typeof part === 'string') return { type: 'input_text', text: part };
-        return normalizeContentPart(part);
-    }).filter(Boolean);
+function normalizeResponseJson(json) {
+    if (!json.choices) return json;
+    const choices = json.choices.map(c => {
+        if (!c.message || c.message.content === undefined) return c;
+        let content = c.message.content;
+        let items = [];
+        if (typeof content === 'string') {
+            items.push({ type: 'output_text', text: content });
+        } else if (Array.isArray(content)) {
+            items = content;
+        }
+        return {
+            ...c,
+            message: {
+                ...c.message,
+                content: items
+            }
+        };
+    });
+    return { ...json, choices };
 }
 
-function normalizeResponseContentPart(part, { preserveReasoning = false } = {}) {
-    if (typeof part === 'string') return { type: 'output_text', text: part };
-    if (!part || typeof part !== 'object') return null;
-    if (part.type === 'refusal') return part;
-    if (part.type === 'reasoning' || part.type === 'reasoning_text' || part.type === 'summary_text') return preserveReasoning ? part : null;
-    if (part.type === 'output_text' || part.type === 'text' || !part.type) { part.type = 'output_text'; return part; }
-    return null;
-}
+function createSseNormalizer(pRes, res, options = {}) {
+    const { onNormalizedEvent, onCompleted } = options;
+    let buffer = '';
+    let lastResponse = null;
 
-function normalizeResponseItem(item, { preserveReasoning = false } = {}) {
-    if (!item || typeof item !== 'object') return item;
-    if (item.type === 'reasoning') {
-        if (!preserveReasoning && !item.summary) item.summary = [{ type: 'summary_text', text: 'Reasoning trace...' }];
-        return preserveReasoning ? item : null;
-    }
-    if (Array.isArray(item.content)) {
-        item.content = item.content.map(part => normalizeResponseContentPart(part, { preserveReasoning })).filter(Boolean);
-    } else if (typeof item.content === 'string') {
-        item.content = [{ type: 'output_text', text: item.content }];
-    }
-    if (!preserveReasoning && Array.isArray(item.content) && item.content.length === 0) return null;
-    return item;
-}
+    pRes.on('data', (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
 
-function normalizeResponseJson(resJson) {
-    if (Array.isArray(resJson.output)) {
-        const norm = resJson.output.map(item => normalizeResponseItem(item)).filter(Boolean);
-        resJson.output = norm.length > 0 ? norm : resJson.output.map(item => normalizeResponseItem(item, { preserveReasoning: true })).filter(Boolean);
-    }
-    if (Array.isArray(resJson.content)) {
-        const norm = resJson.content.map(part => normalizeResponseContentPart(part)).filter(Boolean);
-        resJson.content = norm.length > 0 ? norm : resJson.content.map(part => normalizeResponseContentPart(part, { preserveReasoning: true })).filter(Boolean);
-    } else if (typeof resJson.content === 'string') {
-        resJson.content = [{ type: 'output_text', text: resJson.content }];
-    }
-    return resJson;
-}
-
-function normalizeInputItem(item) {
-    if (!item || typeof item !== 'object') return item;
-    if (item.role === 'tool' && item.type !== 'function_call_output') {
-        item.type = 'function_call_output';
-        if (!item.call_id && item.tool_call_id) item.call_id = item.tool_call_id;
-        if (item.output === undefined && item.content !== undefined) { item.output = item.content; delete item.content; }
-        delete item.role; delete item.tool_call_id;
-    } else if (item.type !== 'function_call_output' && item.type !== 'function_call') {
-        item.type = 'message';
-        if (!item.role) item.role = 'assistant';
-    }
-    if (item.type === 'function_call_output') {
-        if (item.output === undefined && item.content !== undefined) { item.output = item.content; delete item.content; }
-        item.output = normalizeToolOutput(item.output);
-        if (Array.isArray(item.output)) {
-            const hasImg = item.output.some(p => p.type === 'input_image');
-            if (hasImg) {
-                const txt = item.output.filter(p => p.type === 'input_text');
-                const img = item.output.filter(p => p.type === 'input_image');
-                if (txt.length === 0) txt.push({ type: 'input_text', text: '(Image output provided)' });
-                item.output = txt;
-                return [item, { type: 'message', role: 'user', content: img }];
+        for (const line of lines) {
+            if (line.startsWith('data: ')) {
+                const data = line.slice(6);
+                if (data === '[DONE]') {
+                    res.write('data: [DONE]\n\n');
+                    continue;
+                }
+                try {
+                    const json = JSON.parse(data);
+                    lastResponse = json;
+                    // For SSE, we just proxy the chunk but could normalize here if needed
+                    res.write(`data: ${JSON.stringify(json)}\n\n`);
+                } catch (e) {
+                    res.write(`${line}\n`);
+                }
+            } else {
+                res.write(`${line}\n`);
             }
         }
-        return item;
-    }
-    if (item.type !== 'message') return item;
-    if (Array.isArray(item.content)) {
-        item.content = item.content.map(part => normalizeContentPart(part, item.role)).filter(Boolean);
-    } else if (typeof item.content === 'string') {
-        item.content = [{ type: item.role === 'assistant' ? 'output_text' : 'input_text', text: item.content }];
-    }
-    return item;
-}
-
-function doRetry(originalJson, targetPort) {
-    return new Promise((resolve) => {
-        log(`[Proxy] Retrying original prompt for ${originalJson.model}...`);
-        const retryBody = JSON.stringify({ ...originalJson, stream: true });
-        const req = http.request({
-            hostname: TARGET_HOST, port: targetPort, path: '/v1/responses', method: 'POST',
-            headers: { 'content-type': 'application/json', 'accept': 'text/event-stream', 'content-length': Buffer.byteLength(retryBody), 'connection': 'keep-alive' }
-        });
-        let buf = ''; let settled = false;
-        const done = (result) => { if (!settled) { settled = true; resolve(result); } };
-        req.on('response', (retryRes) => {
-            retryRes.setEncoding('utf8');
-            retryRes.on('data', chunk => {
-                buf += chunk; let bi;
-                while ((bi = buf.indexOf('\n\n')) !== -1) {
-                    const raw = buf.slice(0, bi); buf = buf.slice(bi + 2);
-                    for (const line of raw.split('\n')) {
-                        if (!line.startsWith('data:')) continue;
-                        const payload = line.slice(5).trimStart();
-                        if (!payload || payload === '[DONE]') continue;
-                        try {
-                            const parsed = JSON.parse(payload);
-                            if (parsed.type === 'response.completed') {
-                                const output = parsed.response?.output ?? [];
-                                const fcItems = output.filter(i => i.type === 'function_call');
-                                const msgText = output.find(i => i.type === 'message')?.content?.find(c => c.type === 'output_text')?.text ?? '';
-                                done({ items: fcItems, finished: /^\s*FINISHED\s*$/i.test(msgText.trim()) });
-                            }
-                        } catch {}
-                    }
-                }
-            });
-            retryRes.on('end', () => done({ items: [], finished: false }));
-        });
-        req.on('error', () => done({ items: [], finished: false }));
-        req.end(retryBody);
     });
-}
 
-function doReview(originalJson, textContent, targetPort) {
-    return new Promise((resolve) => {
-        log(`[Proxy] Asking for review for ${originalJson.model}...`);
-        const reviewInput = [
-            ...(originalJson.input ?? []),
-            { role: 'assistant', content: [{ type: 'output_text', text: textContent || '(No output produced)' }] },
-            { role: 'user', content: [{ type: 'input_text', text: 'Your previous response did not include a tool call, but you have not signaled that the task is FINISHED. Please review your last response and correctly call the next appropriate tool according to your plan. This is a critical check for loop integrity.' }] }
-        ];
-        const reviewBody = JSON.stringify({ model: originalJson.model, ...(originalJson.tools ? { tools: originalJson.tools } : {}), ...(originalJson.instructions ? { instructions: originalJson.instructions } : {}), input: reviewInput, stream: true });
-        const req = http.request({
-            hostname: TARGET_HOST, port: targetPort, path: '/v1/responses', method: 'POST',
-            headers: { 'content-type': 'application/json', 'accept': 'text/event-stream', 'content-length': Buffer.byteLength(reviewBody), 'connection': 'keep-alive' }
-        });
-        let buf = ''; let settled = false;
-        const done = (result) => { if (!settled) { settled = true; resolve(result); } };
-        req.on('response', (reviewRes) => {
-            reviewRes.setEncoding('utf8');
-            reviewRes.on('data', chunk => {
-                buf += chunk; let bi;
-                while ((bi = buf.indexOf('\n\n')) !== -1) {
-                    const raw = buf.slice(0, bi); buf = buf.slice(bi + 2);
-                    for (const line of raw.split('\n')) {
-                        if (!line.startsWith('data:')) continue;
-                        const payload = line.slice(5).trimStart();
-                        if (!payload || payload === '[DONE]') continue;
-                        try {
-                            const parsed = JSON.parse(payload);
-                            if (parsed.type === 'response.completed') {
-                                const output = parsed.response?.output ?? [];
-                                const fcItems = output.filter(i => i.type === 'function_call');
-                                const msgText = output.find(i => i.type === 'message')?.content?.find(c => c.type === 'output_text')?.text ?? '';
-                                done({ items: fcItems, finished: /^\s*FINISHED\s*$/i.test(msgText.trim()) });
-                            }
-                        } catch {}
-                    }
-                }
-            });
-            reviewRes.on('end', () => done({ items: [], finished: false }));
-        });
-        req.on('error', () => done({ items: [], finished: false }));
-        req.end(reviewBody);
-    });
-}
-
-function createSseNormalizer(proxyRes, res, { onRawEvent, onNormalizedEvent, onCompleted } = {}) {
-    let buffer = ''; let pendingComplete = null;
-    proxyRes.setEncoding('utf8');
-    proxyRes.on('data', chunk => {
-        buffer += chunk; let bi;
-        while ((bi = buffer.indexOf('\n\n')) !== -1) {
-            const raw = buffer.slice(0, bi); buffer = buffer.slice(bi + 2);
-            let skipWrite = false;
-            const norm = raw.split('\n').map(line => {
-                if (!line.startsWith('data:')) return line;
-                const payload = line.slice(5).trimStart();
-                if (!payload || payload === '[DONE]') return line;
-                try {
-                    const parsed = JSON.parse(payload);
-                    if (onRawEvent) onRawEvent(parsed);
-                    if (onCompleted && parsed.type === 'response.completed') { pendingComplete = parsed; skipWrite = true; return line; }
-                    const normalized = normalizeResponseJson(parsed);
-                    if (onNormalizedEvent) onNormalizedEvent(normalized);
-                    return `data: ${JSON.stringify(normalized)}`;
-                } catch { return line; }
-            }).join('\n');
-            if (!skipWrite) res.write(norm + '\n\n');
+    pRes.on('end', () => {
+        if (onCompleted && lastResponse) {
+            onCompleted(lastResponse);
+        } else {
+            res.end();
         }
     });
-    proxyRes.on('end', () => {
-        if (buffer) res.write(buffer);
-        if (pendingComplete) onCompleted(pendingComplete).catch(err => {
-            error(`[Proxy] onCompleted error: ${err.message}`);
-            res.write(`data: ${JSON.stringify(normalizeResponseJson(pendingComplete))}\n\n`); res.end();
-        }); else res.end();
-    });
+}
+
+async function getTargetPortForModel(modelName) {
+    if (!modelName) return TARGET_PORT;
+    if (modelPortCache.has(modelName)) return modelPortCache.get(modelName);
+    
+    // Check which backend currently has this model
+    for (const b of backendStatuses) {
+        if (b.model === modelName) {
+            modelPortCache.set(modelName, b.port);
+            return b.port;
+        }
+    }
+    
+    // Default to main port
+    return TARGET_PORT;
 }
 
 function createRequestHandler(port, isNonStop) {
@@ -762,19 +557,24 @@ function createRequestHandler(port, isNonStop) {
         }
 
 
-        const createProxyReq = (options = {}, tPort = TARGET_PORT, tHost = TARGET_HOST) => {
+        const createProxyReq = (options = {}, tPortOverride, tHostOverride) => {
+            const actualPort = tPortOverride || tPort;
+            const actualHost = tHostOverride || tHost;
             const cleanHeaders = { ...req.headers };
             delete cleanHeaders['host']; delete cleanHeaders['content-length'];
             delete cleanHeaders['transfer-encoding']; delete cleanHeaders['connection'];
-            const { headers: extra = {}, ...rest } = options;
+            const { headers: extraHeaders = {}, ...rest } = options;
+            
+            if (isRedirect && getBusyRedirectApiKey()) extraHeaders['Authorization'] = `Bearer ${getBusyRedirectApiKey()}`;
+            
             const pReq = http.request({
-                hostname: tHost, port: tPort, path: req.url, method: req.method,
-                headers: { ...cleanHeaders, 'host': `${tHost}:${tPort}`, 'connection': 'keep-alive', ...extra },
+                hostname: actualHost, port: actualPort, path: req.url, method: req.method,
+                headers: { ...cleanHeaders, 'host': `${actualHost}:${actualPort}`, 'connection': 'keep-alive', ...extraHeaders },
                 ...rest
             });
             pReq.on('error', (err) => {
-                error(`Upstream Error (${req.method} ${req.url} -> ${tPort}): ${err.message}`);
-                const b = backendStatuses.find(b => b.port === tPort);
+                error(`Upstream Error (${req.method} ${req.url} -> ${actualPort}): ${err.message}`);
+                const b = backendStatuses.find(b => b.port === actualPort);
                 if (b) { b.status = 'STOPPED'; b.progress = undefined; updateStatusFile(); }
                 if (!res.headersSent) {
                     res.writeHead(502, { 'Content-Type': 'application/json' });
@@ -814,48 +614,24 @@ function createRequestHandler(port, isNonStop) {
                         }
                     }
                 }
-                
-                // Inject offline models
-                if (statusCode === 200) {
-                    const activeModelNames = allModels.map(m => m.name || m.id);
-                    for (const offline of OFFLINE_MODELS) {
-                        if (!activeModelNames.includes(offline.alias)) {
-                            allModels.push({
-                                ...MODEL_TEMPLATE,
-                                id: offline.alias,
-                                name: offline.alias,
-                                slug: offline.alias,
-                                display_name: offline.alias,
-                                capabilities: ["completion"]
-                            });
-                        }
-                    }
-                    // Inject virtual "all" model
-                    if (!activeModelNames.includes('all')) {
-                        allModels.push({
-                            ...MODEL_TEMPLATE,
-                            id: 'all',
-                            name: 'all',
-                            slug: 'all',
-                            display_name: 'all (round-robin across all backends)',
-                            capabilities: ["completion"]
-                        });
-                    }
-                    const b = JSON.stringify({ object: "list", models: allModels });
-                    res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(b) }); res.end(b);
+                if (allModels.length > 0) {
+                    allModels.push({ ...MODEL_TEMPLATE, id: "all", name: "all", slug: "all", display_name: "Least Loaded Backend (Virtual)", capabilities: ["completion"] });
+                    res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ object: "list", data: allModels }));
                 } else {
-                    res.writeHead(502, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: "No upstream servers available" }));
+                    res.writeHead(502); res.end(JSON.stringify({ error: "No backends available" }));
                 }
             });
             return;
         }
 
         if (isResponses || isCompletions) {
-            let chunks = []; req.on('data', c => chunks.push(c));
+            let body = '';
+            req.on('data', chunk => body += chunk);
             req.on('end', async () => {
                 try {
-                    const json = JSON.parse(Buffer.concat(chunks).toString());
-                    let tPort = null;
+                    let json = JSON.parse(body);
+                    let tPort = TARGET_PORT;
                     let tHost = TARGET_HOST;
                     const isAllModel = json.model === 'all';
 
@@ -907,8 +683,8 @@ function createRequestHandler(port, isNonStop) {
                                 if (typeof checkBackend === 'function') checkBackend(tPort);
                             }
                         } else if (tPort === TARGET_PORT && (backendQueues.get(tPort)?.activeCount >= backendQueues.get(tPort)?.maxParallel) && redirectServerAvailable) {
-                            log(`[Proxy] Main server busy (${backendQueues.get(tPort).activeCount}/${backendQueues.get(tPort).maxParallel}), redirecting to MLX: ${BUSY_REDIRECT_HOST}`);
-                            tPort = BUSY_REDIRECT_PORT; tHost = BUSY_REDIRECT_HOST; json.model = BUSY_REDIRECT_MODEL; isRedirect = true;
+                            log(`[Proxy] Main server busy (${backendQueues.get(tPort).activeCount}/${backendQueues.get(tPort).maxParallel}), redirecting to MLX: ${getBusyRedirectHost()}`);
+                            tPort = getBusyRedirectPort(); tHost = getBusyRedirectHost(); json.model = getBusyRedirectModel(); isRedirect = true;
                             activeRedirectRequests++;
                             updateStatusFile();
                         }
@@ -955,35 +731,13 @@ function createRequestHandler(port, isNonStop) {
                         }
                     };
 
-                    log(`[Proxy] Port ${port} Request: ${json.model} -> ${tHost}:${tPort} non_stop=${isNonStop}`);
-                    logFull({ type: 'request', port, model: json.model, stream: !!json.stream, target_host: tHost, target_port: tPort, body: sanitizeForLog(json) });
-
-                    if (isResponses) {
-                        if (Array.isArray(json.input)) {
-                            const lastUser = json.input.filter(m => m.role === 'user').pop();
-                            const text = (Array.isArray(lastUser?.content) ? lastUser.content.find(c => c.type === 'input_text' || c.type === 'text')?.text : lastUser?.content) || '';
-                            if (text && text !== lastTitleText) { lastTitleText = text; generateTitle(text); }
-                            json.input = json.input.flatMap(item => normalizeInputItem(item)).filter(Boolean).filter(item => !item.content || item.content.length > 0);
-                        }
-                        if (Array.isArray(json.tools)) {
-                            json.tools = json.tools.filter(t => {
-                                if (t.function) { Object.assign(t, t.function); delete t.function; t.type = 'function'; }
-                                return t.type === 'function';
-                            });
-                        }
-                    }
-
-                    const patched = JSON.stringify(json);
-                    const extraHeaders = { 'content-length': Buffer.byteLength(patched) };
-                    if (isRedirect && BUSY_REDIRECT_API_KEY) extraHeaders['Authorization'] = `Bearer ${BUSY_REDIRECT_API_KEY}`;
+                    const patched = Buffer.from(JSON.stringify(json));
+                    const pReq = createProxyReq({ headers: { 'content-length': patched.length } }, tPort, tHost);
                     
-                    const pReq = createProxyReq({ headers: extraHeaders }, tPort, tHost);
                     pReq.on('response', (pRes) => {
-                        pRes.on('data', () => markGenerating());
-                        
-                        if (isCompletions) {
+                        if (pRes.statusCode >= 300 && pRes.statusCode < 400 && pRes.headers.location) {
                             const newHeaders = { ...pRes.headers };
-                            delete newHeaders['content-length'];
+                            delete newHeaders['location'];
                             res.writeHead(pRes.statusCode, newHeaders);
                             pRes.on('data', (c) => {
                                 let chunkStr = c.toString();
@@ -1020,27 +774,7 @@ function createRequestHandler(port, isNonStop) {
                                 },
                                 async onCompleted(comp) {
                                     const out = comp.response?.output ?? [];
-                                    const hasFC = out.some(i => i.type === 'function_call');
-                                    const compText = out.find(i => i.type === 'message')?.content?.find(c => c.type === 'output_text')?.text;
-                                    const text = textOut || compText || '';
-                                    const hasTools = Array.isArray(json.tools) && json.tools.length > 0;
-                                    let merged = out;
-                                    if (!hasFC && hasTools) {
-                                        const retry = await doRetry(json, tPort); let items = retry.items;
-                                        if (items.length === 0 && (!retry.finished || isNonStop)) {
-                                            const review = await doReview(json, text, tPort); items = review.items;
-                                            if (items.length === 0 && (!review.finished || isNonStop)) {
-                                                const fcId = `fc_proxy_${Math.random().toString(36).slice(2, 11)}`;
-                                                items = [{ type: 'function_call', id: fcId, call_id: fcId, name: 'exec_command', arguments: JSON.stringify({ cmd: "ls -F", justification: "Loop integrity fallback" }) }];
-                                                const evt = { type: 'response.output_item.added', output_index: out.length, item: { type: 'function_call', id: fcId, call_id: fcId, name: 'exec_command', arguments: '' } };
-                                                res.write(`data: ${JSON.stringify(evt)}\n\n`);
-                                                const doneEvt = { type: 'response.output_item.done', output_index: out.length, item: items[0] };
-                                                res.write(`data: ${JSON.stringify(doneEvt)}\n\n`);
-                                            }
-                                        }
-                                        if (items.length > 0) merged = [...out, ...items];
-                                    }
-                                    const finalEvt = normalizeResponseJson(merged === out ? comp : { ...comp, response: { ...comp.response, output: merged } });
+                                    const finalEvt = normalizeResponseJson({ ...comp, response: { ...comp.response, output: out } });
                                     res.write(`data: ${JSON.stringify(finalEvt)}\n\n`); res.end();
                                 }
                             });
@@ -1134,7 +868,7 @@ const checkBackend = (port) => {
                 b.progress = undefined;
                 // Only restart if it was ready recently or if it's been in error state for a long time
                 const lastReady = lastReadyTime.get(port) || 0;
-                if (MONITOR_ENABLED && (Date.now() - lastReady > 60000)) {
+                if (isMonitorEnabled() && (Date.now() - lastReady > 60000)) {
                     restartLlamaService(name, port, `Health status ${res.statusCode}`);
                 }
             }
@@ -1152,7 +886,7 @@ const checkBackend = (port) => {
             // or if it has been stopped for more than 2 minutes (startup safety).
             const lastReady = lastReadyTime.get(port) || 0;
             const timeSinceReady = Date.now() - lastReady;
-            if (MONITOR_ENABLED && (wasReady || timeSinceReady > 120000)) {
+            if (isMonitorEnabled() && (wasReady || timeSinceReady > 120000)) {
                 restartLlamaService(name, port, err.message);
             }
         }
@@ -1160,7 +894,7 @@ const checkBackend = (port) => {
         const b = backendStatuses.find(b => b.port === port);
         if (b) { b.status = 'STOPPED'; b.progress = undefined; updateStatusFile(); }
         // Timeout usually means stuck, restart if it was ready
-        if (MONITOR_ENABLED && lastReadyTime.has(port)) {
+        if (isMonitorEnabled() && lastReadyTime.has(port)) {
             restartLlamaService(name, port, 'Health timeout');
         }
     });
@@ -1168,8 +902,10 @@ const checkBackend = (port) => {
 
 const checkBackends = () => {
     // Check Redirect Server
-    if (BUSY_REDIRECT_HOST && BUSY_REDIRECT_PORT) {
-        http.get({ hostname: BUSY_REDIRECT_HOST, port: BUSY_REDIRECT_PORT, path: '/v1/models', timeout: 5000 }, (res) => {
+    const rHost = getBusyRedirectHost();
+    const rPort = getBusyRedirectPort();
+    if (rHost && rPort) {
+        http.get({ hostname: rHost, port: rPort, path: '/v1/models', timeout: 5000 }, (res) => {
             redirectServerAvailable = (res.statusCode === 200);
         }).on('error', () => {
             redirectServerAvailable = false;
@@ -1181,7 +917,5 @@ const checkBackends = () => {
     BACKEND_PORTS.forEach(port => checkBackend(port));
 };
 
-if (MONITOR_ENABLED) {
-    setInterval(checkBackends, 60000);
-    setTimeout(checkBackends, 1000); // Initial check shortly after startup
-}
+setInterval(checkBackends, 60000);
+setTimeout(checkBackends, 1000); // Initial check shortly after startup
