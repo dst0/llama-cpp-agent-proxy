@@ -32,9 +32,9 @@ const MONITOR_ENABLED = process.env.MONITOR_ENABLED !== 'false';
 const STATUS_FILE = (process.env.STATUS_FILE || `${LOG_DIR}/proxy.status`).replace('~', process.env.HOME || '');
 const TITLE_MODEL = process.env.TITLE_MODEL || 'qwen2.5-0.5b';
 
-const BUSY_REDIRECT_HOST = process.env.BUSY_REDIRECT_HOST || '192.168.8.124';
-const BUSY_REDIRECT_PORT = parseInt(process.env.BUSY_REDIRECT_PORT || '1234', 10);
-const BUSY_REDIRECT_MODEL = process.env.BUSY_REDIRECT_MODEL || 'mtplx-qwen36-27b-optimized-speed';
+const BUSY_REDIRECT_HOST = process.env.BUSY_REDIRECT_HOST || '192.168.8.234';
+const BUSY_REDIRECT_PORT = parseInt(process.env.BUSY_REDIRECT_PORT || '1234');
+const BUSY_REDIRECT_MODEL = process.env.BUSY_REDIRECT_MODEL || 'gemma-4-26b-a4b-it-mlx';
 const BUSY_REDIRECT_API_KEY = process.env.BUSY_REDIRECT_API_KEY || '';
 
 let lastTitle = 'Idle';
