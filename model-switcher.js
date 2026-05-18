@@ -54,12 +54,14 @@ export async function switchModel(targetModelId, targetPort, log = console.log) 
             envContent = updateOrAdd(envContent, 'MODEL', targetConfig.modelPath);
             envContent = updateOrAdd(envContent, 'ALIAS', targetConfig.alias);
             
-            const tmpPath = '/home/dst/dev/llama-cpp-agent-proxy/env.tmp';
+            const tmpPath = path.join(process.env.HOME || '', '.llama-cpp-agent-proxy', 'env.tmp');
+            fs.mkdirSync(path.dirname(tmpPath), { recursive: true });
             fs.writeFileSync(tmpPath, envContent);
             
             await new Promise((resolve, reject) => {
-                // Ensure mv succeeds before trying to restart. pkill is allowed to "fail" (return 1 if no process found).
-                const cmd = `sudo -n mv ${tmpPath} ${ENV_FILE} && (sudo -n pkill -9 -f "port ${targetPort}" || true) && sudo -n systemctl restart llama-server-main`;
+                // Ensure mv succeeds before trying to restart. pkill is allowed to "fail".
+                // Ensure the new env file is world-readable so the 'llama' user can read it.
+                const cmd = `sudo -n mv ${tmpPath} ${ENV_FILE} && sudo -n chmod 644 ${ENV_FILE} && (sudo -n pkill -9 -f "port ${targetPort}" || true) && sudo -n systemctl restart llama-server-main`;
                 exec(cmd, (err, stdout, stderr) => {
                     if (err) {
                         log(`[ModelSwitcher] Command failed. Stdout: ${stdout}, Stderr: ${stderr}`);

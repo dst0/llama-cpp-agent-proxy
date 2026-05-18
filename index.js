@@ -56,6 +56,7 @@ function error(msg) { console.error(msg); writeLog(LOG_FILE, `ERROR: ${msg}`); }
 // 4. Configuration Loader
 function loadConfig() {
     try {
+        const isFirstLoad = !configState.redirect.host; // rough check
         if (!fs.existsSync(CONFIG_PATH)) {
             const defaultConfig = {
                 network: {
@@ -82,7 +83,8 @@ function loadConfig() {
             
             fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
             fs.writeFileSync(CONFIG_PATH, tomlStr);
-            log(`[Config] Created default configuration at ${CONFIG_PATH}`);
+            if (isFirstLoad) console.log(`[Config] Created default configuration at ${CONFIG_PATH}`);
+            else log(`[Config] Created default configuration at ${CONFIG_PATH}`);
         }
 
         const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
@@ -103,9 +105,10 @@ function loadConfig() {
             configState.backends.monitor_enabled = parsed.backends.monitor_enabled;
         }
         
-        log(`[Config] Loaded configuration from ${CONFIG_PATH}`);
+        if (isFirstLoad) console.log(`[Config] Loaded configuration from ${CONFIG_PATH}`);
+        else log(`[Config] Loaded configuration from ${CONFIG_PATH}`);
     } catch (e) {
-        error(`[Config] Failed to load config: ${e.message}`);
+        console.error(`[Config] Failed to load config: ${e.message}`);
     }
 }
 
@@ -883,11 +886,16 @@ const checkBackend = (port) => {
             updateStatusFile(); 
             
             // Only auto-restart if it was previously functioning and now crashed, 
-            // or if it has been stopped for more than 2 minutes (startup safety).
+            // or if it has been ready at least once and then stopped for more than 2 minutes.
             const lastReady = lastReadyTime.get(port) || 0;
-            const timeSinceReady = Date.now() - lastReady;
-            if (isMonitorEnabled() && (wasReady || timeSinceReady > 120000)) {
-                restartLlamaService(name, port, err.message);
+            const timeSinceReady = lastReady > 0 ? Date.now() - lastReady : -1;
+            
+            if (isMonitorEnabled()) {
+                if (wasReady) {
+                    restartLlamaService(name, port, err.message);
+                } else if (lastReady > 0 && timeSinceReady > 120000) {
+                    restartLlamaService(name, port, `Stuck for ${Math.round(timeSinceReady/1000)}s: ${err.message}`);
+                }
             }
         }
     }).on('timeout', () => {
