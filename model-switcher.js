@@ -39,10 +39,11 @@ export async function switchModel(targetModelId, targetPort, log = console.log) 
             envContent = envContent.replace(/^MODEL=.*$/m, `MODEL=${targetConfig.modelPath}`);
             envContent = envContent.replace(/^ALIAS=.*$/m, `ALIAS=${targetConfig.alias}`);
             
-            fs.writeFileSync('/tmp/llama-server-main.env.tmp', envContent);
+            const tmpPath = '/home/dst/dev/llama-cpp-agent-proxy/env.tmp';
+            fs.writeFileSync(tmpPath, envContent);
             
             await new Promise((resolve, reject) => {
-                exec(`sudo -n mv /tmp/llama-server-main.env.tmp ${ENV_FILE} && sudo -n pkill -9 -f "port ${targetPort}" && sudo -n systemctl restart llama-server-main`, (err) => {
+                exec(`sudo -n mv ${tmpPath} ${ENV_FILE} && sudo -n pkill -9 -f "port ${targetPort}" ; sudo -n systemctl restart llama-server-main`, (err) => {
                     if (err) reject(err);
                     else resolve();
                 });

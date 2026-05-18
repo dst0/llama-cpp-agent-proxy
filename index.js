@@ -7,8 +7,17 @@ import { OFFLINE_MODELS, switchModel } from './model-switcher.js';
 
 const TARGET_HOST = process.env.TARGET_HOST || '127.0.0.1';
 const TARGET_PORT = parseInt(process.env.TARGET_PORT || '11435', 10);
-const BACKEND_PORTS = (process.env.BACKEND_PORTS || `${TARGET_PORT}`).split(',').map(p => parseInt(p.trim(), 10));
-const BACKEND_SERVICES = (process.env.BACKEND_SERVICES || 'llama-server').split(',').map(s => s.trim());
+
+// Backend config: host:port:service:logFile (logFile optional)
+const BACKEND_CONFIGS = (process.env.BACKEND_CONFIGS || `${TARGET_HOST}:${TARGET_PORT}:llama-server:/opt/llama/logs/main-stderr.log`).split(',').map(entry => {
+    const [host, port, service, logFile] = entry.trim().split(':');
+    return { host: host || TARGET_HOST, port: parseInt(port, 10), service: service || 'llama-server', logFile: logFile || null };
+}).filter(b => !isNaN(b.port));
+
+// Derived for backward compatibility
+const BACKEND_PORTS = BACKEND_CONFIGS.map(b => b.port);
+const BACKEND_SERVICES = BACKEND_CONFIGS.map(b => b.service);
+const BACKEND_LOG_FILES = BACKEND_CONFIGS.map(b => b.logFile || '');
 
 // Standard ports for Two-Port Proxy Architecture
 const LISTEN_PORTS = (process.env.PORTS || process.env.PORT || '11450,11451').split(',').map(p => parseInt(p.trim(), 10));
@@ -35,7 +44,7 @@ let activeRedirectRequests = 0;
 const activeRequestsPerPort = new Map();
 const backendHTTPActivity = new Map();
 BACKEND_PORTS.forEach(p => backendHTTPActivity.set(p, { prefilling: 0, generating: 0 }));
-const backendStatuses = BACKEND_PORTS.map(port => ({ port, status: 'IDLE', progress: undefined }));
+const backendStatuses = BACKEND_CONFIGS.map(b => ({ ...b, status: 'IDLE', progress: undefined, model: undefined }));
 const modelPortCache = new Map();
 const sseClients = new Set();
 
@@ -80,12 +89,69 @@ class BackendQueue {
 const backendQueues = new Map();
 BACKEND_PORTS.forEach(p => backendQueues.set(p, new BackendQueue(p)));
 
+// Virtual "all" model queue: routes to least-loaded backend, parallelism = # backends
+class VirtualQueue {
+    constructor(configs) {
+        this.configs = configs;
+        this.active = 0;
+        this.maxParallel = configs.length;
+        this.queue = [];
+    }
+
+    async acquire() {
+        if (this.active < this.maxParallel) {
+            const backend = this.pickBackend();
+            this.active++;
+            updateStatusFile();
+            const bq = backendQueues.get(backend.port);
+            const release = await bq.acquire();
+            return {
+                tHost: backend.host,
+                tPort: backend.port,
+                release: () => {
+                    release();
+                    this.active--;
+                    this.dispatchNext();
+                    updateStatusFile();
+                }
+            };
+        }
+        return new Promise(resolve => {
+            this.queue.push(resolve);
+            updateStatusFile();
+        }).then(() => this.acquire());
+    }
+
+    pickBackend() {
+        let best = null, bestLoad = Infinity;
+        for (const b of this.configs) {
+            const load = (activeRequestsPerPort.get(b.port) || 0) +
+                        (backendHTTPActivity.get(b.port)?.generating || 0) +
+                        (backendHTTPActivity.get(b.port)?.prefilling || 0);
+            if (load < bestLoad) { bestLoad = load; best = b; }
+        }
+        return best;
+    }
+
+    dispatchNext() {
+        if (this.queue.length > 0) {
+            const next = this.queue.shift();
+            next();
+        }
+    }
+
+    get size() { return this.queue.length; }
+}
+
+const virtualQueue = new VirtualQueue(BACKEND_CONFIGS);
+backendQueues.set('all', virtualQueue);
+
 const PROMPT_PROGRESS_RE = /prompt processing progress,.*?(?:progress\s*=\s*([\d.]+)|([\d.]+)\s*%)/i;
 
 function startLogWatcher() {
-    const LOG_FILES = (process.env.BACKEND_LOG_FILES || '/opt/llama/logs/main-stderr.log,/opt/llama/logs/micro-stderr.log').split(',').map(f => f.trim());
-    for (let i = 0; i < BACKEND_PORTS.length; i++) {
-        const port = BACKEND_PORTS[i];
+    const LOG_FILES = BACKEND_LOG_FILES;
+    for (let i = 0; i < BACKEND_CONFIGS.length; i++) {
+        const port = BACKEND_CONFIGS[i].port;
         const logFile = LOG_FILES[i];
         if (!port || !logFile) continue;
         
@@ -153,6 +219,7 @@ function getStatus() {
     return {
         active_requests: Array.from(activeRequestsPerPort.values()).reduce((a, b) => a + b, 0),
         queue_size: totalQueueSize,
+        virtual_queue: { model: 'all', size: virtualQueue.size, active: virtualQueue.active, max_parallel: virtualQueue.maxParallel },
         redirect_server: {
             host: BUSY_REDIRECT_HOST,
             port: BUSY_REDIRECT_PORT,
@@ -170,10 +237,30 @@ function getStatus() {
 }
 
 function broadcastStatus(status) {
-    const data = `data: ${JSON.stringify(status)}\n\n`;
+    const data = `event: status\ndata: ${JSON.stringify(status)}\n\n`;
+    const dead = [];
     for (const client of sseClients) {
-        try { client.write(data); } catch (e) { sseClients.delete(client); }
+        try { client.write(data); } catch (e) { dead.push(client); }
     }
+    for (const client of dead) sseClients.delete(client);
+}
+
+// SSE heartbeat: send comment lines every 15s to prevent proxy idle-timeout kills
+const SSE_HEARTBEAT_INTERVAL = 15000;
+let sseHeartbeatTimer = null;
+function startSseHeartbeat() {
+    if (sseHeartbeatTimer) return;
+    sseHeartbeatTimer = setInterval(() => {
+        const dead = [];
+        for (const client of sseClients) {
+            try { client.write(':heartbeat\n\n'); } catch (e) { dead.push(client); }
+        }
+        for (const client of dead) sseClients.delete(client);
+        if (sseClients.size === 0) stopSseHeartbeat();
+    }, SSE_HEARTBEAT_INTERVAL);
+}
+function stopSseHeartbeat() {
+    if (sseHeartbeatTimer) { clearInterval(sseHeartbeatTimer); sseHeartbeatTimer = null; }
 }
 
 function updateStatusFile() {
@@ -237,6 +324,7 @@ async function generateTitle(inputText) {
 
 const getTargetPortForModel = async (modelName) => {
     if (!modelName) return TARGET_PORT;
+    if (modelName === 'all') return null; // Virtual model — handled separately
     if (modelName.includes(':')) {
         const parts = modelName.split(':');
         const port = parseInt(parts[parts.length - 1], 10);
@@ -245,11 +333,11 @@ const getTargetPortForModel = async (modelName) => {
     if (modelPortCache.has(modelName)) return modelPortCache.get(modelName);
     if (modelName === 'qwen2.5-0.5b' && BACKEND_PORTS.includes(11438)) return 11438;
 
-    for (const port of BACKEND_PORTS) {
+    for (const config of BACKEND_CONFIGS) {
         const result = await new Promise((resolve) => {
             const req = http.request({
-                hostname: TARGET_HOST, port: port, path: '/v1/models', method: 'GET',
-                headers: { 'host': `${TARGET_HOST}:${port}` }
+                hostname: config.host, port: config.port, path: '/v1/models', method: 'GET',
+                headers: { 'host': `${config.host}:${config.port}` }
             });
             req.on('response', (res) => {
                 let body = '';
@@ -276,11 +364,13 @@ const getTargetPortForModel = async (modelName) => {
     return TARGET_PORT;
 };
 
-const getUpstreamProps = (port = TARGET_PORT) => {
+const getUpstreamProps = (config) => {
+    const host = config?.host || TARGET_HOST;
+    const port = config?.port || TARGET_PORT;
     return new Promise((resolve) => {
         let settled = false;
         const finish = (value = {}) => { if (!settled) { settled = true; resolve(value); } };
-        const propsReq = http.get(`http://${TARGET_HOST}:${port}/props`, (propsRes) => {
+        const propsReq = http.get(`http://${host}:${port}/props`, (propsRes) => {
             let data = '';
             propsRes.on('data', c => data += c);
             propsRes.on('end', () => { try { finish(JSON.parse(data)); } catch { finish({}); } });
@@ -614,11 +704,14 @@ function createRequestHandler(port, isNonStop) {
 
         const isModels = req.method === 'GET' && req.url.startsWith('/v1/models');
         const isResponses = req.method === 'POST' && req.url.startsWith('/v1/responses');
+        const isCompletions = req.method === 'POST' && (req.url.startsWith('/v1/chat/completions') || req.url.startsWith('/v1/completions'));
 
         if (isStatusEvents) {
-            res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-            res.write(`data: ${JSON.stringify(getStatus())}\n\n`);
-            sseClients.add(res); req.on('close', () => sseClients.delete(res));
+            res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
+            res.write(`event: status\ndata: ${JSON.stringify(getStatus())}\n\n`);
+            sseClients.add(res);
+            req.on('close', () => { sseClients.delete(res); if (sseClients.size === 0) stopSseHeartbeat(); });
+            startSseHeartbeat();
             return;
         }
 
@@ -652,13 +745,13 @@ function createRequestHandler(port, isNonStop) {
         };
 
         if (isModels) {
-            Promise.all(BACKEND_PORTS.map(p => {
+            Promise.all(BACKEND_CONFIGS.map(config => {
                 return new Promise((resolve) => {
-                    const pReq = http.request({ hostname: TARGET_HOST, port: p, path: req.url, method: req.method, headers: { 'host': `${TARGET_HOST}:${p}` } });
+                    const pReq = http.request({ hostname: config.host, port: config.port, path: req.url, method: req.method, headers: { 'host': `${config.host}:${config.port}` } });
                     pReq.on('response', (pRes) => {
                         let chunks = []; pRes.on('data', c => chunks.push(c));
                         pRes.on('end', async () => {
-                            const data = Buffer.concat(chunks).toString(); const props = await getUpstreamProps(p);
+                            const data = Buffer.concat(chunks).toString(); const props = await getUpstreamProps(config);
                             try { resolve({ json: JSON.parse(data), props, statusCode: pRes.statusCode }); } catch { resolve(null); }
                         });
                     });
@@ -697,6 +790,17 @@ function createRequestHandler(port, isNonStop) {
                             });
                         }
                     }
+                    // Inject virtual "all" model
+                    if (!activeModelNames.includes('all')) {
+                        allModels.push({
+                            ...MODEL_TEMPLATE,
+                            id: 'all',
+                            name: 'all',
+                            slug: 'all',
+                            display_name: 'all (round-robin across all backends)',
+                            capabilities: ["completion"]
+                        });
+                    }
                     const b = JSON.stringify({ object: "list", models: allModels });
                     res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(b) }); res.end(b);
                 } else {
@@ -706,18 +810,32 @@ function createRequestHandler(port, isNonStop) {
             return;
         }
 
-        if (isResponses) {
+        if (isResponses || isCompletions) {
             let chunks = []; req.on('data', c => chunks.push(c));
             req.on('end', async () => {
                 try {
                     const json = JSON.parse(Buffer.concat(chunks).toString());
-                    let tPort = await getTargetPortForModel(json.model);
+                    let tPort = null;
                     let tHost = TARGET_HOST;
-                    
-                    // Dynamic Model Switching Logic
-                    // Ensure request pauses in queue if a switch is necessary
-                    const isOfflineModel = OFFLINE_MODELS.some(m => m.id === json.model || m.alias === json.model);
-                    if (isOfflineModel || (tPort !== null && backendStatuses.find(b => b.port === tPort)?.model !== json.model)) {
+                    const isAllModel = json.model === 'all';
+
+                    // Virtual "all" model: route to least-loaded backend via virtual queue
+                    if (isAllModel) {
+                        log(`[Proxy] Virtual "all" model request. Picking least-loaded backend...`);
+                        const vqResult = await virtualQueue.acquire();
+                        tHost = vqResult.tHost;
+                        tPort = vqResult.tPort;
+                        releaseBackend = () => {
+                            vqResult.release();
+                        };
+                        log(`[Proxy] "all" -> ${tHost}:${tPort}`);
+                    } else {
+                        tPort = await getTargetPortForModel(json.model);
+
+                        // Dynamic Model Switching Logic
+                        // Ensure request pauses in queue if a switch is necessary
+                        const isOfflineModel = OFFLINE_MODELS.some(m => m.id === json.model || m.alias === json.model);
+                        if (isOfflineModel || (tPort !== null && backendStatuses.find(b => b.port === tPort)?.model !== json.model)) {
                         // We will force the request into the main queue (TARGET_PORT) if we need to switch
                         const switchTargetPort = TARGET_PORT;
                         tPort = switchTargetPort;
@@ -789,17 +907,19 @@ function createRequestHandler(port, isNonStop) {
                     log(`[Proxy] Port ${port} Request: ${json.model} -> ${tHost}:${tPort} non_stop=${isNonStop}`);
                     logFull({ type: 'request', port, model: json.model, stream: !!json.stream, target_host: tHost, target_port: tPort, body: sanitizeForLog(json) });
 
-                    if (Array.isArray(json.input)) {
-                        const lastUser = json.input.filter(m => m.role === 'user').pop();
-                        const text = (Array.isArray(lastUser?.content) ? lastUser.content.find(c => c.type === 'input_text' || c.type === 'text')?.text : lastUser?.content) || '';
-                        if (text && text !== lastTitleText) { lastTitleText = text; generateTitle(text); }
-                        json.input = json.input.flatMap(item => normalizeInputItem(item)).filter(Boolean).filter(item => !item.content || item.content.length > 0);
-                    }
-                    if (Array.isArray(json.tools)) {
-                        json.tools = json.tools.filter(t => {
-                            if (t.function) { Object.assign(t, t.function); delete t.function; t.type = 'function'; }
-                            return t.type === 'function';
-                        });
+                    if (isResponses) {
+                        if (Array.isArray(json.input)) {
+                            const lastUser = json.input.filter(m => m.role === 'user').pop();
+                            const text = (Array.isArray(lastUser?.content) ? lastUser.content.find(c => c.type === 'input_text' || c.type === 'text')?.text : lastUser?.content) || '';
+                            if (text && text !== lastTitleText) { lastTitleText = text; generateTitle(text); }
+                            json.input = json.input.flatMap(item => normalizeInputItem(item)).filter(Boolean).filter(item => !item.content || item.content.length > 0);
+                        }
+                        if (Array.isArray(json.tools)) {
+                            json.tools = json.tools.filter(t => {
+                                if (t.function) { Object.assign(t, t.function); delete t.function; t.type = 'function'; }
+                                return t.type === 'function';
+                            });
+                        }
                     }
 
                     const patched = JSON.stringify(json);
@@ -809,6 +929,23 @@ function createRequestHandler(port, isNonStop) {
                     const pReq = createProxyReq({ headers: extraHeaders }, tPort, tHost);
                     pReq.on('response', (pRes) => {
                         pRes.on('data', () => markGenerating());
+                        
+                        if (isCompletions) {
+                            const newHeaders = { ...pRes.headers };
+                            delete newHeaders['content-length'];
+                            res.writeHead(pRes.statusCode, newHeaders);
+                            pRes.on('data', (c) => {
+                                let chunkStr = c.toString();
+                                chunkStr = chunkStr.replace(/"model":\s*"[^"]+"/g, `"model":"${json.model}"`);
+                                res.write(chunkStr);
+                            });
+                            pRes.on('end', () => {
+                                res.end();
+                                if (releaseBackend) { releaseBackend(); releaseBackend = null; }
+                            });
+                            return;
+                        }
+
                         if (!json.stream) {
                             let resChunks = []; pRes.on('data', c => resChunks.push(c));
                             pRes.on('end', () => {
@@ -862,6 +999,7 @@ function createRequestHandler(port, isNonStop) {
                         }
                     });
                     pReq.write(patched); pReq.end();
+                    }
                 } catch (e) { cleanup(); res.writeHead(500); res.end(e.message); }
             });
             return;
