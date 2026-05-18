@@ -905,13 +905,17 @@ const checkBackends = () => {
     const rHost = getBusyRedirectHost();
     const rPort = getBusyRedirectPort();
     if (rHost && rPort) {
-        http.get({ hostname: rHost, port: rPort, path: '/v1/models', timeout: 5000 }, (res) => {
+        const checkReq = http.get({ hostname: rHost, port: rPort, path: '/v1/models', timeout: 5000 }, (res) => {
             redirectServerAvailable = (res.statusCode === 200);
             updateStatusFile();
-        }).on('error', () => {
+            res.resume(); // consume the response
+        });
+        checkReq.on('error', (err) => {
             redirectServerAvailable = false;
             updateStatusFile();
-        }).on('timeout', () => {
+        });
+        checkReq.on('timeout', () => {
+            checkReq.destroy();
             redirectServerAvailable = false;
             updateStatusFile();
         });
