@@ -593,24 +593,19 @@ function normalizeResponseJson(json) {
         if (!msg || msg.content === undefined) return msg;
         
         let content = msg.content;
-        let items = [];
         if (typeof content === 'string') {
-            if (content.length > 0 || !msg.tool_calls) {
-                items.push({ type: 'output_text', text: content });
-            }
+            // Keep plain text as-is
+            return msg;
         } else if (Array.isArray(content)) {
-            items = content.map(item => {
-                if (item.type === 'text' || item.type === 'output_text') return { type: 'output_text', text: item.text };
-                return item;
-            }).filter(item => item.type !== 'reasoning_text' && item.type !== 'reasoning');
+            // Extract plain text from structured content
+            let textContent = content
+                .filter(item => item.type === 'text' || item.type === 'output_text' || item.type === 'input_text')
+                .map(item => item.text)
+                .join('');
+            return { ...msg, content: textContent };
         }
 
-        // Preserve reasoning_content if present (common in some llama.cpp forks/models)
-        if (msg.reasoning_content && !items.some(i => i.type === 'reasoning')) {
-            items.unshift({ type: 'reasoning', text: msg.reasoning_content });
-        }
-
-        return { ...msg, content: items };
+        return msg;
     };
 
     if (json.choices) {
