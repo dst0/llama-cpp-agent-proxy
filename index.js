@@ -515,30 +515,42 @@ async function getUpstreamProps(config) {
 function normalizeRequestJson(json) {
     if (json.tools && Array.isArray(json.tools)) {
         json.tools = json.tools.map(tool => {
-            if (tool.type === 'function' && tool.function) {
-                return {
-                    type: 'function',
-                    name: tool.function.name,
-                    description: tool.function.description,
-                    parameters: tool.function.parameters
-                };
+            if (tool.type === 'function') {
+                // OpenAI-compatible backends (like llama.cpp) REQUIRE the nested "function" object.
+                // Do NOT flatten this structure, or the backend will return a 500 "Missing tool function" error.
+                if (tool.function) return tool; // Keep nested
+                if (tool.name) {
+                    // Nest flat tool from other formats into the required "function" structure
+                    return {
+                        type: 'function',
+                        function: {
+                            name: tool.name,
+                            description: tool.description,
+                            parameters: tool.parameters
+                        }
+                    };
+                }
             }
             return tool;
         });
     }
 
     const normalizeContent = (content, role = 'user') => {
-        if (typeof content === 'string') return [{ type: (role === 'assistant' ? 'output_text' : 'input_text'), text: content }];
+        // llama.cpp is strict about content types. It expects "text" for text content.
+        // Using non-standard types like "input_text" or "output_text" results in 400 "unsupported content[].type".
+        if (typeof content === 'string') return [{ type: 'text', text: content }];
         if (Array.isArray(content)) {
             return content.map(item => {
                 if (item.type === 'text' || item.type === 'output_text' || item.type === 'input_text') {
-                    return { type: (role === 'assistant' ? 'output_text' : 'input_text'), text: item.text };
+                    return { type: 'text', text: item.text };
                 }
                 if (item.type === 'input_image') return { type: 'input_image', image_url: item.image_url?.url || item.image_url };
-                return item;
-            }).filter(item => item.type !== 'reasoning_text' && item.type !== 'reasoning');
+                // Map other types (e.g. reasoning) to a safe default if needed or filter
+                if (item.type === 'reasoning_text' || item.type === 'reasoning') return null;
+                return { type: 'text', text: typeof item.text === 'string' ? item.text : '' };
+            }).filter(item => item !== null);
         }
-        return content;
+        return [{ type: 'text', text: '' }];
     };
 
     if (json.messages && Array.isArray(json.messages)) {
@@ -561,7 +573,7 @@ function normalizeRequestJson(json) {
             return true;
         }).map(item => {
             if (item.type === 'function_call_output') {
-                return { ...item, output: normalizeContent(item.output, 'tool') }; // tool output is input_text
+                return { ...item, output: normalizeContent(item.output, 'tool') }; // tool output is normalized to "text"
             }
             if (item.role === 'tool') {
                 return { type: 'function_call_output', call_id: item.tool_call_id, output: normalizeContent(item.content, 'tool') };
@@ -1027,8 +1039,9 @@ function createRequestHandler(port, isNonStop) {
                                                         log(`[Proxy] Non-Stop: Model finished on port ${port}. Injecting follow-up (attempt ${attempt})...`);
                                                         const nextJson = { ...currentJson };
                                                         nextJson.input = [...(nextJson.input || []),
-                                                            { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: content }] },
-                                                            { type: 'message', role: 'user', content: [{ type: 'input_text', text: "Please continue with the next step. If the task is fully complete, provide a final summary of what was accomplished." }] }
+                                                            // llama.cpp requires "text" type. Do NOT use "output_text" or "input_text" here or it will 400.
+                                                            { type: 'message', role: 'assistant', content: [{ type: 'text', text: content }] },
+                                                            { type: 'message', role: 'user', content: [{ type: 'text', text: "Please continue with the next step. If the task is fully complete, provide a final summary of what was accomplished." }] }
                                                         ];
                                                         if (releaseBackend) { releaseBackend(); releaseBackend = null; }
                                                         resolve(executeBackendRequest(nextJson, attempt + 1));
@@ -1047,8 +1060,9 @@ function createRequestHandler(port, isNonStop) {
                                                         log(`[Proxy] Recovery: Model finished without tool call and short content. Injecting review prompt...`);
                                                         const nextJson = { ...currentJson };
                                                         nextJson.input = [...(nextJson.input || []),
-                                                            { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: content }] },
-                                                            { type: 'message', role: 'user', content: [{ type: 'input_text', text: "You haven't called a tool yet. Please check the available tools and call the appropriate one to proceed." }] }
+                                                            // llama.cpp requires "text" type. Do NOT use "output_text" or "input_text" here or it will 400.
+                                                            { type: 'message', role: 'assistant', content: [{ type: 'text', text: content }] },
+                                                            { type: 'message', role: 'user', content: [{ type: 'text', text: "You haven't called a tool yet. Please check the available tools and call the appropriate one to proceed." }] }
                                                         ];
                                                         if (releaseBackend) { releaseBackend(); releaseBackend = null; }
                                                         resolve(executeBackendRequest(nextJson, attempt + 1));
@@ -1108,8 +1122,9 @@ function createRequestHandler(port, isNonStop) {
                                                 log(`[Proxy] Non-Stop: Model finished stream on port ${port}. Injecting follow-up (attempt ${attempt})...`);
                                                 const nextJson = { ...currentJson };
                                                 nextJson.input = [...(nextJson.input || []),
-                                                    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: fullContent }] },
-                                                    { type: 'message', role: 'user', content: [{ type: 'input_text', text: "Please continue. What is the next logical action?" }] }
+                                                    // llama.cpp requires "text" type. Do NOT use "output_text" or "input_text" here or it will 400.
+                                                    { type: 'message', role: 'assistant', content: [{ type: 'text', text: fullContent }] },
+                                                    { type: 'message', role: 'user', content: [{ type: 'text', text: "Please continue. What is the next logical action?" }] }
                                                 ];
                                                 if (releaseBackend) { log(`[Proxy] Releasing backend before recursive call`); releaseBackend(); releaseBackend = null; }
                                                 resolve(executeBackendRequest(nextJson, attempt + 1));
@@ -1121,8 +1136,9 @@ function createRequestHandler(port, isNonStop) {
                                                 log(`[Proxy] Recovery: Model finished without tool call and short content. Injecting review prompt (attempt ${attempt})...`);
                                                 const nextJson = { ...currentJson };
                                                 nextJson.input = [...(nextJson.input || []),
-                                                    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: fullContent }] },
-                                                    { type: 'message', role: 'user', content: [{ type: 'input_text', text: "You haven't called a tool yet. Please check the available tools and call the appropriate one to proceed." }] }
+                                                    // llama.cpp requires "text" type. Do NOT use "output_text" or "input_text" here or it will 400.
+                                                    { type: 'message', role: 'assistant', content: [{ type: 'text', text: fullContent }] },
+                                                    { type: 'message', role: 'user', content: [{ type: 'text', text: "You haven't called a tool yet. Please check the available tools and call the appropriate one to proceed." }] }
                                                 ];
                                                 if (releaseBackend) { log(`[Proxy] Releasing backend before recursive call`); releaseBackend(); releaseBackend = null; }
                                                 resolve(executeBackendRequest(nextJson, attempt + 1));
