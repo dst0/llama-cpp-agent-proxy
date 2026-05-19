@@ -1199,8 +1199,8 @@ function restartLlamaService(name, port, reason) {
     
     const cmd = `(systemctl --user restart ${name} 2>/dev/null) || ` +
                 `(sudo -n systemctl restart ${name} 2>/dev/null) || ` +
-                `(pkill -9 -f "port ${port}" 2>/dev/null && echo "Killed via pkill") || ` +
-                `(sudo -n pkill -9 -f "port ${port}" 2>/dev/null && echo "Killed via sudo pkill")`;
+                `(pkill -9 -f "[p]ort ${port}" 2>/dev/null && echo "Killed via pkill") || ` +
+                `(sudo -n pkill -9 -f "[p]ort ${port}" 2>/dev/null && echo "Killed via sudo pkill")`;
 
     exec(cmd, (err, stdout, stderr) => {
         if (err) {

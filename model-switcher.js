@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { exec } from 'node:child_process';
 import http from 'node:http';
 import path from 'node:path';
+import os from 'node:os';
 
 const ENV_FILE = '/etc/llama/llama-server-main.env';
 
@@ -55,21 +56,35 @@ export async function switchModel(targetModelId, targetPort, log = console.log) 
             envContent = updateOrAdd(envContent, 'MODEL', targetConfig.modelPath);
             envContent = updateOrAdd(envContent, 'ALIAS', targetConfig.alias);
             
-            const tmpPath = path.join(process.env.HOME || '', '.llama-cpp-agent-proxy', 'env.tmp');
-            fs.mkdirSync(path.dirname(tmpPath), { recursive: true });
+            const tmpPath = path.join(os.tmpdir(), `llama-server-env-${Date.now()}.tmp`);
             fs.writeFileSync(tmpPath, envContent);
             
             await new Promise((resolve, reject) => {
-                // Ensure mv succeeds before trying to restart. pkill is allowed to "fail".
-                // Ensure the new env file is world-readable so the 'llama' user can read it.
-                const cmd = `sudo -n mv ${tmpPath} ${ENV_FILE} && sudo -n chmod 644 ${ENV_FILE} && (sudo -n pkill -9 -f "port ${targetPort}" || true) && sudo -n systemctl restart llama-server-main`;
-                exec(cmd, (err, stdout, stderr) => {
-                    if (err) {
-                        log(`[ModelSwitcher] Command failed. Stdout: ${stdout}, Stderr: ${stderr}`);
-                        reject(err);
+                const steps = [
+                    { cmd: `sudo -n mv ${tmpPath} ${ENV_FILE}`, desc: 'mv env file' },
+                    { cmd: `sudo -n chmod 644 ${ENV_FILE}`, desc: 'chmod env file' },
+                    { cmd: `sudo -n pkill -9 -f "[p]ort ${targetPort}" || true`, desc: 'pkill llama-server' },
+                    { cmd: `sudo -n systemctl restart llama-server-main`, desc: 'restart service' }
+                ];
+
+                async function runSteps(index) {
+                    if (index >= steps.length) {
+                        resolve();
+                        return;
                     }
-                    else resolve();
-                });
+                    const step = steps[index];
+                    log(`[ModelSwitcher] Running step ${index + 1}/${steps.length}: ${step.desc}`);
+                    exec(step.cmd, (err, stdout, stderr) => {
+                        if (err) {
+                            log(`[ModelSwitcher] Step ${step.desc} failed. Command: ${step.cmd}, Stdout: ${stdout}, Stderr: ${stderr}`);
+                            reject(err);
+                        } else {
+                            runSteps(index + 1);
+                        }
+                    });
+                }
+
+                runSteps(0);
             });
             
             log(`[ModelSwitcher] Restart triggered, waiting for health check on port ${targetPort}...`);
