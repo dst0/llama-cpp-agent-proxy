@@ -12,12 +12,16 @@ A high-performance, transparent compatibility bridge between **Codex** (and othe
 - **Liveness Monitoring**: Background monitoring for all backends with automatic service restarts if an upstream instance becomes unresponsive or fails health checks.
 - **Network Ready**: Binds to `0.0.0.0` for full LAN accessibility.
 
-## Unified Two-Port Architecture
+## Unified Three-Port Architecture
 
-The proxy runs as a single unified process that manages both ports (Standard and Non-Stop) and all backends. This provides a unified status view and serialized backend queuing.
+The proxy runs as a single unified process that manages all ports (Standard, Non-Stop, and Enforced) and all backends. This provides a unified status view and serialized backend queuing.
 
 - **Port 11450 (Standard Mode)**: Accepts `FINISHED` responses. Use this for standard agentic workflows.
-- **Port 11451 (Non-Stop Mode)**: Rejects `FINISHED` responses from models. Even if a model claims to be done, the proxy forces it to continue.
+- **Port 11451 (Non-Stop Mode)**: Rejects `FINISHED` responses from models. Even if a model claims to be done, the proxy injects follow-up prompts to force continuation. Caps at 3 retry attempts before returning the final response.
+- **Port 11452 (Enforced Mode)**: Adaptive behavior:
+  - **With tools provided**: Behaves like Standard (11450) — accepts FINISHED responses normally.
+  - **Without tools**: Behaves like Non-Stop (11451) — rejects FINISHED, injects follow-up prompts (caps at 3).
+  - **Fallback**: If Non-Stop logic exhausts all retries without a tool call, injects a safe fallback tool call to keep the agentic loop alive.
 
 ### Observability & Status
 
@@ -57,8 +61,9 @@ If the file does not exist, the proxy will create it with default values on star
 [network]
 target_host = "127.0.0.1"
 target_port = 11435
-ports = [11450, 11451]
+ports = [11450, 11451, 11452]
 non_stop_ports = [11451]
+enforced_ports = [11452]
 
 [backends]
 ports = [11435, 1234]
@@ -113,8 +118,9 @@ By default it binds to ports `11450` (Standard) and `11451` (Non-Stop).
 ### 3. Usage
 
 Point your agents to the desired proxy:
-- **Non-stop agent**: `http://localhost:11451/v1`
 - **Standard agent**: `http://localhost:11450/v1`
+- **Non-stop agent**: `http://localhost:11451/v1`
+- **Enforced agent**: `http://localhost:11452/v1`
 
 ## Configuration
 

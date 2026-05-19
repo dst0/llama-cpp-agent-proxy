@@ -35,6 +35,18 @@ let TARGET_PORT = parseInt(process.env.TARGET_PORT || (_tomlTargetPort ? _tomlTa
 const LISTEN_PORTS = (process.env.PORT || process.env.PORTS || (_tomlPorts ? _tomlPorts.join(',') : '11450,11451')).split(',').map(p => parseInt(p.trim(), 10));
 const NON_STOP_PORTS = (process.env.NON_STOP_PORTS || (process.env.NON_STOP_MODE === 'true' ? process.env.PORT : null) || (_tomlNonStopPorts ? _tomlNonStopPorts.join(',') : '11451') || '').split(',').map(p => parseInt(p.trim(), 10)).filter(p => !isNaN(p));
 
+// Enforced ports: always inject a fallback tool call when model finishes without one
+let _tomlEnforcedPorts = null;
+try {
+    if (fs.existsSync(CONFIG_PATH)) {
+        const _parsed = parseToml(fs.readFileSync(CONFIG_PATH, 'utf8'));
+        if (_parsed.network && _parsed.network.enforced_ports) {
+            _tomlEnforcedPorts = Array.isArray(_parsed.network.enforced_ports) ? _parsed.network.enforced_ports : null;
+        }
+    }
+} catch {}
+const ENFORCED_PORTS = (process.env.ENFORCED_PORTS || (_tomlEnforcedPorts ? _tomlEnforcedPorts.join(',') : '11452') || '').split(',').map(p => parseInt(p.trim(), 10)).filter(p => !isNaN(p));
+
 const PROXY_PORT_PRIMARY = LISTEN_PORTS[0] || 11450;
 const DEFAULT_LOG_DIR = `~/.llama-cpp-agent-proxy/logs/${PROXY_PORT_PRIMARY}`.replace('~', process.env.HOME || '');
 const LOG_DIR = (process.env.LOG_DIR || DEFAULT_LOG_DIR).replace('~', process.env.HOME || '');
@@ -85,7 +97,8 @@ function loadConfig() {
                     target_host: TARGET_HOST,
                     target_port: TARGET_PORT,
                     ports: LISTEN_PORTS,
-                    non_stop_ports: NON_STOP_PORTS
+                    non_stop_ports: NON_STOP_PORTS,
+                    enforced_ports: ENFORCED_PORTS
                 },
                 backends: {
                     ports: [11435, 1234],
@@ -717,7 +730,7 @@ async function getTargetPortForModel(modelName) {
     return TARGET_PORT;
 }
 
-function createRequestHandler(port, isNonStop) {
+function createRequestHandler(port, isNonStop, isEnforced) {
     return (req, res) => {
         const isStatus = req.method === 'GET' && req.url === '/v1/status';
         const isStatusEvents = req.method === 'GET' && req.url === '/v1/status/events';
@@ -1042,7 +1055,46 @@ function createRequestHandler(port, isNonStop) {
                                                         resolve(executeBackendRequest(nextJson, attempt + 1));
                                                         return;
                                                     }
-                                                    
+
+                                                    // Enforced Mode: Standard if tools provided, else Non-Stop + fallback injection
+                                                    if (isEnforced && isFinished && !hasToolCall) {
+                                                        if (currentJson.tools?.length > 0) {
+                                                            // Tools provided → behave like Standard (11450): accept FINISHED
+                                                            return;
+                                                        }
+                                                        // No tools → behave like Non-Stop (11451) with fallback injection as last resort
+                                                        if (attempt < 3) {
+                                                            log(`[Proxy] Enforced: Model finished on port ${port} without tool call. Injecting follow-up (attempt ${attempt})...`);
+                                                            const nextJson = { ...currentJson };
+                                                            nextJson.input = [...(nextJson.input || []),
+                                                                { type: 'message', role: 'assistant', content: [{ type: 'text', text: content }] },
+                                                                { type: 'message', role: 'user', content: [{ type: 'text', text: "Please continue with the next step. If the task is fully complete, provide a final summary of what was accomplished." }] }
+                                                            ];
+                                                            if (releaseBackend) { releaseBackend(); releaseBackend = null; }
+                                                            resolve(executeBackendRequest(nextJson, attempt + 1));
+                                                            return;
+                                                        }
+                                                        // Non-Stop exhausted → inject fallback tool call and return (no recursion)
+                                                        log(`[Proxy] Enforced: Non-Stop exhausted on port ${port}. Injecting fallback tool call and returning...`);
+                                                        const fallbackToolCall = {
+                                                            id: `call_${Date.now()}`,
+                                                            type: 'function',
+                                                            function: {
+                                                                name: 'bash',
+                                                                arguments: JSON.stringify({ command: 'echo "I\'m in enforced non-stop mode, so I will review conversation, codebase and continue the improvement cycle"' })
+                                                            }
+                                                        };
+                                                        resJson.choices[0].message.tool_calls = [fallbackToolCall];
+                                                        resJson.choices[0].message.content = content;
+                                                        const final = JSON.stringify(resJson);
+                                                        const h = { ...pRes.headers }; delete h['content-length']; delete h['transfer-encoding'];
+                                                        h['content-length'] = Buffer.byteLength(final);
+                                                        res.writeHead(pRes.statusCode, h); res.end(final);
+                                                        if (releaseBackend) { releaseBackend(); releaseBackend = null; }
+                                                        resolve();
+                                                        return;
+                                                    }
+
                                                     if (attempt < 3 && !hasToolCall && !isFinished && isContentEmpty) {
                                                         log(`[Proxy] Recovery: Model stalled (no content, no tool call). Retrying (attempt ${attempt})...`);
                                                         if (releaseBackend) { releaseBackend(); releaseBackend = null; }
@@ -1126,6 +1178,45 @@ function createRequestHandler(port, isNonStop) {
                                                 return;
                                             }
 
+                                            // Enforced Mode: Standard if tools provided, else Non-Stop + fallback injection
+                                            if (isEnforced && lastFinishReason === 'stop' && !hasSeenToolCall) {
+                                                if (currentJson.tools?.length > 0) {
+                                                    // Tools provided → behave like Standard (11450): accept FINISHED
+                                                    return;
+                                                }
+                                                // No tools → behave like Non-Stop (11451) with fallback injection as last resort
+                                                if (attempt < 3) {
+                                                    log(`[Proxy] Enforced: Model finished stream on port ${port} without tool call. Injecting follow-up (attempt ${attempt})...`);
+                                                    const nextJson = { ...currentJson };
+                                                    nextJson.input = [...(nextJson.input || []),
+                                                        { type: 'message', role: 'assistant', content: [{ type: 'text', text: fullContent }] },
+                                                        { type: 'message', role: 'user', content: [{ type: 'text', text: "Please continue. What is the next logical action?" }] }
+                                                    ];
+                                                    if (releaseBackend) { log(`[Proxy] Releasing backend before recursive call`); releaseBackend(); releaseBackend = null; }
+                                                    resolve(executeBackendRequest(nextJson, attempt + 1));
+                                                    return;
+                                                }
+                                                // Non-Stop exhausted → inject fallback tool call and return (no recursion)
+                                                log(`[Proxy] Enforced: Non-Stop exhausted on port ${port}. Injecting fallback tool call and returning...`);
+                                                const fallbackToolCall = {
+                                                    id: `call_${Date.now()}`,
+                                                    type: 'function',
+                                                    function: {
+                                                        name: 'bash',
+                                                        arguments: JSON.stringify({ command: 'echo "I\'m in enforced non-stop mode, so I will review conversation, codebase and continue the improvement cycle"' })
+                                                    }
+                                                };
+                                                resJson.choices[0].message.tool_calls = [fallbackToolCall];
+                                                resJson.choices[0].message.content = fullContent;
+                                                const final = JSON.stringify(resJson);
+                                                const h = { ...pRes.headers }; delete h['content-length']; delete h['transfer-encoding'];
+                                                h['content-length'] = Buffer.byteLength(final);
+                                                res.writeHead(pRes.statusCode, h); res.end(final);
+                                                if (releaseBackend) { log(`[Proxy] Releasing backend before returning`); releaseBackend(); releaseBackend = null; }
+                                                resolve();
+                                                return;
+                                            }
+
                                             // Recovery Flow: If it finished without a tool call but work is likely pending
                                             if (currentJson.tools?.length > 0 && !isNonStop && lastFinishReason === 'stop' && !hasSeenToolCall && attempt < 2 && fullContent.length < 50) {
                                                 log(`[Proxy] Recovery: Model finished without tool call and short content. Injecting review prompt (attempt ${attempt})...`);
@@ -1195,8 +1286,9 @@ function createRequestHandler(port, isNonStop) {
 
 LISTEN_PORTS.forEach(port => {
     const isNonStop = NON_STOP_PORTS.includes(port);
-    http.createServer(createRequestHandler(port, isNonStop)).listen(port, "0.0.0.0", () => {
-        log(`[Proxy] Listening on 0.0.0.0:${port} (non_stop=${isNonStop})`);
+    const isEnforced = ENFORCED_PORTS.includes(port);
+    http.createServer(createRequestHandler(port, isNonStop, isEnforced)).listen(port, "0.0.0.0", () => {
+        log(`[Proxy] Listening on 0.0.0.0:${port} (non_stop=${isNonStop}, enforced=${isEnforced})`);
     });
 });
 
