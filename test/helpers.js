@@ -34,6 +34,7 @@ export function startMockUpstream(onReq, port = null) {
             }
         });
         server.listen(listenPort, '127.0.0.1', () => {
+            server.unref();
             resolve({ server, port: server.address().port });
         });
     });
@@ -56,6 +57,7 @@ export function startMockUpstreamMulti(onReq, ports) {
         for (const port of ports) {
             const server = http.createServer(onReq);
             server.listen(port, '127.0.0.1', () => {
+                server.unref();
                 servers.push(server);
                 resolvedCount++;
                 if (resolvedCount === ports.length) {

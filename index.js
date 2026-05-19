@@ -9,14 +9,31 @@ import { OFFLINE_MODELS, switchModel } from './model-switcher.js';
 // --- Initialization sequence ---
 
 // 1. Basic Paths & Static Env
-const CONFIG_PATH = path.join(process.env.HOME || '', '.llama-cpp-agent-proxy', 'config.toml');
+const CONFIG_PATH = process.env.CONFIG_PATH || path.join(process.env.HOME || '', '.llama-cpp-agent-proxy', 'config.toml');
 
-// 2. Mutable configuration variables (will be updated by loadConfig)
-let TARGET_HOST = process.env.TARGET_HOST || '127.0.0.1';
-let TARGET_PORT = parseInt(process.env.TARGET_PORT || '11435', 10);
+// 2. Pre-load config.toml for port defaults (before const declarations)
+let _tomlPorts = null;
+let _tomlNonStopPorts = null;
+let _tomlTargetHost = null;
+let _tomlTargetPort = null;
+try {
+    if (fs.existsSync(CONFIG_PATH)) {
+        const _parsed = parseToml(fs.readFileSync(CONFIG_PATH, 'utf8'));
+        if (_parsed.network) {
+            _tomlPorts = Array.isArray(_parsed.network.ports) ? _parsed.network.ports : null;
+            _tomlNonStopPorts = Array.isArray(_parsed.network.non_stop_ports) ? _parsed.network.non_stop_ports : null;
+            _tomlTargetHost = _parsed.network.target_host || null;
+            _tomlTargetPort = _parsed.network.target_port || null;
+        }
+    }
+} catch {}
 
-const LISTEN_PORTS = (process.env.PORTS || process.env.PORT || '11450,11451').split(',').map(p => parseInt(p.trim(), 10));
-const NON_STOP_PORTS = (process.env.NON_STOP_PORTS || (process.env.NON_STOP_MODE === 'true' ? process.env.PORT : '11451') || '').split(',').map(p => parseInt(p.trim(), 10)).filter(p => !isNaN(p));
+// 3. Mutable configuration variables (will be updated by loadConfig)
+let TARGET_HOST = process.env.TARGET_HOST || _tomlTargetHost || '127.0.0.1';
+let TARGET_PORT = parseInt(process.env.TARGET_PORT || (_tomlTargetPort ? _tomlTargetPort.toString() : null) || '11435', 10);
+
+const LISTEN_PORTS = (process.env.PORT || process.env.PORTS || (_tomlPorts ? _tomlPorts.join(',') : '11450,11451')).split(',').map(p => parseInt(p.trim(), 10));
+const NON_STOP_PORTS = (process.env.NON_STOP_PORTS || (process.env.NON_STOP_MODE === 'true' ? process.env.PORT : null) || (_tomlNonStopPorts ? _tomlNonStopPorts.join(',') : '11451') || '').split(',').map(p => parseInt(p.trim(), 10)).filter(p => !isNaN(p));
 
 const PROXY_PORT_PRIMARY = LISTEN_PORTS[0] || 11450;
 const DEFAULT_LOG_DIR = `~/.llama-cpp-agent-proxy/logs/${PROXY_PORT_PRIMARY}`.replace('~', process.env.HOME || '');
@@ -55,6 +72,8 @@ function writeLog(filePath, line) {
 }
 function log(msg) { console.log(msg); writeLog(LOG_FILE, msg); }
 function error(msg) { console.error(msg); writeLog(LOG_FILE, `ERROR: ${msg}`); }
+
+let lastConfigHash = '';
 
 // 4. Configuration Loader
 function loadConfig() {
@@ -96,12 +115,15 @@ function loadConfig() {
         }
 
         const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
+        if (raw === lastConfigHash && !isFirstLoad) return;
+        lastConfigHash = raw;
+
         const parsed = parseToml(raw);
         
-        // Update mutable parts of config
+        // Update mutable parts of config (Env takes precedence)
         if (parsed.network) {
-            TARGET_HOST = parsed.network.target_host || TARGET_HOST;
-            TARGET_PORT = parsed.network.target_port || TARGET_PORT;
+            TARGET_HOST = process.env.TARGET_HOST || parsed.network.target_host || TARGET_HOST;
+            TARGET_PORT = parseInt(process.env.TARGET_PORT || (parsed.network.target_port ? parsed.network.target_port.toString() : null) || TARGET_PORT.toString(), 10);
         }
         
         if (parsed.redirects && Array.isArray(parsed.redirects)) {
@@ -142,7 +164,7 @@ function loadConfig() {
 loadConfig();
 
 // Reload every minute
-setInterval(loadConfig, 60000);
+setInterval(loadConfig, 60000).unref();
 
 // Use configState for derived values
 const getRedirects = () => configState.redirects;
@@ -161,9 +183,13 @@ function pickBestRedirect() {
     return available.sort((a, b) => getModelSize(b.model) - getModelSize(a.model))[0];
 }
 
-// Backend config: host:port:service:logFile (logFile optional)
-const BACKEND_CONFIGS = (process.env.BACKEND_CONFIGS || `${TARGET_HOST}:${TARGET_PORT}:llama-server:/opt/llama/logs/main-stderr.log`).split(',').map(entry => {
-    const [host, port, service, logFile] = entry.trim().split(':');
+// Backend config: host:port:service:logFile (logFile optional) or just port
+const BACKEND_CONFIGS = (process.env.BACKEND_CONFIGS || process.env.BACKEND_PORTS || `${TARGET_HOST}:${TARGET_PORT}:llama-server:/opt/llama/logs/main-stderr.log`).split(',').map(entry => {
+    const parts = entry.trim().split(':');
+    if (parts.length === 1 && !isNaN(parseInt(parts[0], 10))) {
+        return { host: TARGET_HOST, port: parseInt(parts[0], 10), service: 'llama-server', logFile: null };
+    }
+    const [host, port, service, logFile] = parts;
     return { host: host || TARGET_HOST, port: parseInt(port, 10), service: service || 'llama-server', logFile: logFile || null };
 }).filter(b => !isNaN(b.port));
 
@@ -172,9 +198,13 @@ const BACKEND_PORTS = BACKEND_CONFIGS.map(b => b.port);
 const BACKEND_SERVICES = BACKEND_CONFIGS.map(b => b.service);
 const BACKEND_LOG_FILES = BACKEND_CONFIGS.map(b => b.logFile || '');
 
+if (!process.env.TARGET_PORT && BACKEND_PORTS.length > 0) {
+    TARGET_PORT = BACKEND_PORTS[0];
+}
+
 let lastTitle = 'Idle';
 let lastTitleText = '';
-let activeRedirectRequests = 0;
+const activeRedirectRequestsPerTarget = new Map();
 const activeRequestsPerPort = new Map();
 const backendHTTPActivity = new Map();
 BACKEND_PORTS.forEach(p => backendHTTPActivity.set(p, { prefilling: 0, generating: 0 }));
@@ -244,7 +274,7 @@ class VirtualQueue {
             this.activeCount++;
             updateStatusFile();
             const bq = backendQueues.get(backend.port);
-            const release = await bq.acquire();
+            const bqRelease = await bq.acquire();
             let released = false;
             return {
                 tHost: backend.host,
@@ -252,8 +282,8 @@ class VirtualQueue {
                 release: () => {
                     if (released) return;
                     released = true;
-                    release();
-                    this.activeCount--;
+                    bqRelease();
+                    this.activeCount = Math.max(0, this.activeCount - 1);
                     this.dispatchNext();
                     updateStatusFile();
                 }
@@ -262,7 +292,7 @@ class VirtualQueue {
         return new Promise(resolve => {
             this.waiting.push(resolve);
             updateStatusFile();
-        }).then(() => this.acquire());
+        });
     }
 
     pickBackend() {
@@ -280,7 +310,7 @@ class VirtualQueue {
     dispatchNext() {
         if (this.waiting.length > 0) {
             const next = this.waiting.shift();
-            next();
+            this.acquire().then(next);
         }
     }
 
@@ -393,15 +423,19 @@ function getStatus() {
             model: bestRedirect.model,
             display: `${bestRedirect.host} → ${bestRedirect.model}`,
             available: true,
-            active_requests: activeRedirectRequests
+            active_requests: activeRedirectRequestsPerTarget.get(`${bestRedirect.host}:${bestRedirect.port}:${bestRedirect.model}`) || 0
         } : { available: false },
-        redirects: configState.redirects.map(r => ({ 
-            host: r.host, 
-            port: r.port, 
-            model: r.model, 
-            display: `${r.host} → ${r.model}`,
-            available: r.available 
-        })),
+        redirects: configState.redirects.map(r => {
+            const key = `${r.host}:${r.port}:${r.model}`;
+            return { 
+                host: r.host, 
+                port: r.port, 
+                model: r.model, 
+                display: `${r.host} → ${r.model}`,
+                available: r.available,
+                active_requests: activeRedirectRequestsPerTarget.get(key) || 0
+            };
+        }),
         ports: portsStatus,
         queues: queuesStatus,
         last_title: lastTitle,
@@ -428,7 +462,7 @@ setInterval(() => {
     if (sseClients.size > 0) {
         broadcastStatus(getStatus());
     }
-}, BROADCAST_INTERVAL);
+}, BROADCAST_INTERVAL).unref();
 
 // SSE heartbeat: send comment lines every 15s to prevent proxy idle-timeout kills
 const SSE_HEARTBEAT_INTERVAL = 15000;
@@ -440,7 +474,7 @@ function startSseHeartbeat() {
         for (const client of sseClients) {
             try { client.write(data); } catch (e) {}
         }
-    }, SSE_HEARTBEAT_INTERVAL);
+    }, SSE_HEARTBEAT_INTERVAL).unref();
 }
 function stopSseHeartbeat() {
     if (sseHeartbeatTimer) {
@@ -460,7 +494,8 @@ const MODEL_TEMPLATE = {
     object: "model",
     created: Math.floor(Date.now() / 1000),
     owned_by: "llama.cpp",
-    capabilities: ["completion"]
+    capabilities: ["completion"],
+    supported_reasoning_levels: ["none", "low", "medium", "high"]
 };
 
 async function getUpstreamProps(config) {
@@ -477,30 +512,132 @@ async function getUpstreamProps(config) {
     });
 }
 
+function normalizeRequestJson(json) {
+    if (json.tools && Array.isArray(json.tools)) {
+        json.tools = json.tools.map(tool => {
+            if (tool.type === 'function' && tool.function) {
+                return {
+                    type: 'function',
+                    name: tool.function.name,
+                    description: tool.function.description,
+                    parameters: tool.function.parameters
+                };
+            }
+            return tool;
+        });
+    }
+
+    const normalizeContent = (content, role = 'user') => {
+        if (typeof content === 'string') return [{ type: (role === 'assistant' ? 'output_text' : 'input_text'), text: content }];
+        if (Array.isArray(content)) {
+            return content.map(item => {
+                if (item.type === 'text' || item.type === 'output_text' || item.type === 'input_text') {
+                    return { type: (role === 'assistant' ? 'output_text' : 'input_text'), text: item.text };
+                }
+                if (item.type === 'input_image') return { type: 'input_image', image_url: item.image_url?.url || item.image_url };
+                return item;
+            }).filter(item => item.type !== 'reasoning_text' && item.type !== 'reasoning');
+        }
+        return content;
+    };
+
+    if (json.messages && Array.isArray(json.messages)) {
+        json.messages = json.messages.filter(m => {
+            if (m.role === 'assistant' && Array.isArray(m.content)) {
+                return m.content.some(item => item.type !== 'reasoning_text' && item.type !== 'reasoning');
+            }
+            return true;
+        }).map(m => ({
+            ...m,
+            content: normalizeContent(m.content, m.role)
+        }));
+    }
+
+    if (json.input && Array.isArray(json.input)) {
+        json.input = json.input.filter(item => {
+            if (item.role === 'assistant' && Array.isArray(item.content)) {
+                return item.content.some(c => c.type !== 'reasoning_text' && c.type !== 'reasoning');
+            }
+            return true;
+        }).map(item => {
+            if (item.type === 'function_call_output') {
+                return { ...item, output: normalizeContent(item.output, 'tool') }; // tool output is input_text
+            }
+            if (item.role === 'tool') {
+                return { type: 'function_call_output', call_id: item.tool_call_id, output: normalizeContent(item.content, 'tool') };
+            }
+            if (item.role === 'user' || item.role === 'assistant') {
+                return { type: 'message', role: item.role, content: normalizeContent(item.content, item.role) };
+            }
+            return item;
+        });
+    }
+
+    return json;
+}
+
 function normalizeResponseJson(json) {
-    if (!json.choices) return json;
-    const choices = json.choices.map(c => {
-        if (!c.message || c.message.content === undefined) return c;
-        let content = c.message.content;
+    const normalizeMsg = (msg) => {
+        if (!msg || msg.content === undefined) return msg;
+        
+        let content = msg.content;
         let items = [];
         if (typeof content === 'string') {
-            items.push({ type: 'output_text', text: content });
-        } else if (Array.isArray(content)) {
-            items = content;
-        }
-        return {
-            ...c,
-            message: {
-                ...c.message,
-                content: items
+            if (content.length > 0 || !msg.tool_calls) {
+                items.push({ type: 'output_text', text: content });
             }
-        };
-    });
-    return { ...json, choices };
+        } else if (Array.isArray(content)) {
+            items = content.map(item => {
+                if (item.type === 'text' || item.type === 'output_text') return { type: 'output_text', text: item.text };
+                return item;
+            }).filter(item => item.type !== 'reasoning_text' && item.type !== 'reasoning');
+        }
+
+        // Preserve reasoning_content if present (common in some llama.cpp forks/models)
+        if (msg.reasoning_content && !items.some(i => i.type === 'reasoning')) {
+            items.unshift({ type: 'reasoning', text: msg.reasoning_content });
+        }
+
+        return { ...msg, content: items };
+    };
+
+    if (json.choices) {
+        json.choices = json.choices.map(c => {
+            const msg = c.message || c.delta;
+            if (!msg) return c;
+            return {
+                ...c,
+                [c.message ? 'message' : 'delta']: normalizeMsg(msg)
+            };
+        });
+    }
+
+    const processOutput = (output) => {
+        if (!Array.isArray(output)) return output;
+        const hasMessage = output.some(item => item.type === 'message');
+        return output.filter(item => {
+            if (item.type === 'reasoning' && hasMessage) return false;
+            return true;
+        }).map(item => {
+            if (item.type === 'message') {
+                return normalizeMsg(item);
+            }
+            return item;
+        });
+    };
+
+    if (json.output) {
+        json.output = processOutput(json.output);
+    }
+    if (json.response?.output) {
+        json.response.output = processOutput(json.response.output);
+    }
+
+    return json;
 }
 
 function createSseNormalizer(pRes, res, options = {}) {
-    const { onNormalizedEvent, onCompleted } = options;
+    const { onNormalizedEvent, onCompleted, suppressDone } = options;
     let buffer = '';
     let lastResponse = null;
 
@@ -511,29 +648,47 @@ function createSseNormalizer(pRes, res, options = {}) {
 
         for (const line of lines) {
             if (line.startsWith('data: ')) {
-                const data = line.slice(6);
+                const data = line.slice(6).trim();
                 if (data === '[DONE]') {
-                    res.write('data: [DONE]\n\n');
+                    if (!suppressDone) res.write('data: [DONE]\n\n');
                     continue;
                 }
                 try {
-                    const json = JSON.parse(data);
+                    let json = JSON.parse(data);
+                    json = normalizeResponseJson(json);
                     lastResponse = json;
-                    // For SSE, we just proxy the chunk but could normalize here if needed
+                    if (onNormalizedEvent) onNormalizedEvent(json);
                     res.write(`data: ${JSON.stringify(json)}\n\n`);
                 } catch (e) {
-                    res.write(`${line}\n`);
+                    res.write(`${line}\n\n`);
                 }
-            } else {
+            } else if (line.trim() || line === '') {
+                // Preserve empty lines as SSE delimiters, but only one
                 res.write(`${line}\n`);
             }
         }
     });
 
-    pRes.on('end', () => {
-        if (onCompleted && lastResponse) {
-            onCompleted(lastResponse);
+    pRes.on('end', async () => {
+        if (buffer.trim()) {
+            const line = buffer;
+            if (line.startsWith('data: ')) {
+                const data = line.slice(6).trim();
+                if (data !== '[DONE]') {
+                    try {
+                        let json = JSON.parse(data);
+                        json = normalizeResponseJson(json);
+                        lastResponse = json;
+                        if (onNormalizedEvent) onNormalizedEvent(json);
+                        res.write(`data: ${JSON.stringify(json)}\n\n`);
+                    } catch (e) {}
+                }
+            }
+        }
+        if (onCompleted) {
+            await onCompleted(lastResponse);
         } else {
+            if (!suppressDone) res.write('data: [DONE]\n\n');
             res.end();
         }
     });
@@ -575,7 +730,10 @@ function createRequestHandler(port, isNonStop) {
             if (!decremented) {
                 if (!isStatus && !isStatusEvents && !isMetadata) {
                     activeRequestsPerPort.set(port, Math.max(0, (activeRequestsPerPort.get(port) || 0) - 1));
-                    if (isRedirect) activeRedirectRequests = Math.max(0, activeRedirectRequests - 1);
+                    if (isRedirect && currentRedirect) {
+                        const key = `${currentRedirect.host}:${currentRedirect.port}:${currentRedirect.model}`;
+                        activeRedirectRequestsPerTarget.set(key, Math.max(0, (activeRedirectRequestsPerTarget.get(key) || 0) - 1));
+                    }
                     markFinished();
                     updateStatusFile();
                 }
@@ -593,7 +751,7 @@ function createRequestHandler(port, isNonStop) {
 
         if (isStatusEvents) {
             res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no' });
-            res.write(`event: status\ndata: ${JSON.stringify(getStatus())}\n\n`);
+            res.write(`data: ${JSON.stringify(getStatus())}\n\n`);
             sseClients.add(res);
             req.on('close', () => { sseClients.delete(res); if (sseClients.size === 0) stopSseHeartbeat(); });
             startSseHeartbeat();
@@ -608,17 +766,17 @@ function createRequestHandler(port, isNonStop) {
 
 
         const createProxyReq = (options = {}, tPortOverride, tHostOverride) => {
-            const actualPort = tPortOverride || tPort;
-            const actualHost = tHostOverride || tHost;
+            const actualPort = tPortOverride || TARGET_PORT;
+            const actualHost = tHostOverride || TARGET_HOST;
             const cleanHeaders = { ...req.headers };
             delete cleanHeaders['host']; delete cleanHeaders['content-length'];
             delete cleanHeaders['transfer-encoding']; delete cleanHeaders['connection'];
             const { headers: extraHeaders = {}, ...rest } = options;
-            
+
             if (isRedirect && currentRedirect?.api_key) {
                 extraHeaders['Authorization'] = `Bearer ${currentRedirect.api_key}`;
             }
-            
+
             const pReq = http.request({
                 hostname: actualHost, port: actualPort, path: req.url, method: req.method,
                 headers: { ...cleanHeaders, 'host': `${actualHost}:${actualPort}`, 'connection': 'keep-alive', ...extraHeaders },
@@ -631,19 +789,28 @@ function createRequestHandler(port, isNonStop) {
                 if (!res.headersSent) {
                     res.writeHead(502, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ error: "Upstream server unavailable", details: err.message }));
+                } else {
+                    // If we already started streaming, we should probably still close the connection
+                    // and maybe write an error event if it's SSE
+                    if (req.url.includes('stream=true') || req.headers.accept === 'text/event-stream') {
+                        res.write(`data: ${JSON.stringify({ error: "Upstream server connection failed during stream", details: err.message })}\n\n`);
+                        res.write('data: [DONE]\n\n');
+                    }
+                    res.end();
                 }
             });
             pReq.setTimeout(0); return pReq;
         };
+
 
         if (isModels) {
             Promise.all(BACKEND_CONFIGS.map(config => {
                 return new Promise((resolve) => {
                     const pReq = http.request({ hostname: config.host, port: config.port, path: req.url, method: req.method, headers: { 'host': `${config.host}:${config.port}` } });
                     pReq.on('response', (pRes) => {
-                        let chunks = []; pRes.on('data', c => chunks.push(c));
+                        let data = ''; pRes.on('data', (c) => data += c);
                         pRes.on('end', async () => {
-                            const data = Buffer.concat(chunks).toString(); const props = await getUpstreamProps(config);
+                            const props = await getUpstreamProps(config);
                             try { resolve({ json: JSON.parse(data), props, statusCode: pRes.statusCode }); } catch { resolve(null); }
                         });
                     });
@@ -669,7 +836,7 @@ function createRequestHandler(port, isNonStop) {
                 if (allModels.length > 0) {
                     allModels.push({ ...MODEL_TEMPLATE, id: "all", name: "all", slug: "all", display_name: "Least Loaded Backend (Virtual)", capabilities: ["completion"] });
                     res.writeHead(statusCode, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ object: "list", data: allModels }));
+                    res.end(JSON.stringify({ object: "list", data: allModels, models: allModels }));
                 } else {
                     res.writeHead(502); res.end(JSON.stringify({ error: "No backends available" }));
                 }
@@ -683,6 +850,7 @@ function createRequestHandler(port, isNonStop) {
             req.on('end', async () => {
                 try {
                     let json = JSON.parse(body);
+                    json = normalizeRequestJson(json);
                     let tPort = TARGET_PORT;
                     let tHost = TARGET_HOST;
                     const isAllModel = json.model === 'all';
@@ -740,11 +908,14 @@ function createRequestHandler(port, isNonStop) {
                                 log(`[Proxy] Main server busy (${backendQueues.get(tPort).activeCount}/${backendQueues.get(tPort).maxParallel}), redirecting to MLX: ${bestRedirect.host}`);
                                 currentRedirect = bestRedirect;
                                 tPort = bestRedirect.port; tHost = bestRedirect.host; json.model = bestRedirect.model; isRedirect = true;
-                                activeRedirectRequests++;
+                                const key = `${bestRedirect.host}:${bestRedirect.port}:${bestRedirect.model}`;
+                                activeRedirectRequestsPerTarget.set(key, (activeRedirectRequestsPerTarget.get(key) || 0) + 1);
                                 updateStatusFile();
                             }
                         }
                     }
+
+                    log(`[Proxy] Port ${port} Request: ${json.model} -> ${tHost}:${tPort} (non_stop=${isNonStop})`);
 
                     // Standard Backend Queuing logic for non-switching requests
                     if (!releaseBackend) {
@@ -757,6 +928,8 @@ function createRequestHandler(port, isNonStop) {
                                 if (b) b.progress = undefined;
                                 release();
                             };
+                        } else {
+                            log(`[Proxy] Warning: No queue found for port ${tPort}. Proceeding without queue.`);
                         }
                     }
 
@@ -788,55 +961,216 @@ function createRequestHandler(port, isNonStop) {
                     };
 
                     const patched = Buffer.from(JSON.stringify(json));
-                    const pReq = createProxyReq({ headers: { 'content-length': patched.length } }, tPort, tHost);
                     
-                    pReq.on('response', (pRes) => {
-                        if (pRes.statusCode >= 300 && pRes.statusCode < 400 && pRes.headers.location) {
-                            const newHeaders = { ...pRes.headers };
-                            delete newHeaders['location'];
-                            res.writeHead(pRes.statusCode, newHeaders);
-                            pRes.on('data', (c) => {
-                                let chunkStr = c.toString();
-                                chunkStr = chunkStr.replace(/"model":\s*"[^"]+"/g, `"model":"${json.model}"`);
-                                res.write(chunkStr);
-                            });
-                            pRes.on('end', () => {
-                                res.end();
-                            });
-                            return;
-                        }
+                    async function executeBackendRequest(currentJson, attempt = 1) {
+                        const currentPatched = Buffer.from(JSON.stringify(currentJson));
+                        const pReq = createProxyReq({ headers: { 'content-length': currentPatched.length } }, tPort, tHost);
+                        
+                        return new Promise((resolve, reject) => {
+                            pReq.on('response', (pRes) => {
+                                if (pRes.statusCode >= 300 && pRes.statusCode < 400 && pRes.headers.location) {
+                                    const newHeaders = { ...pRes.headers };
+                                    delete newHeaders['location'];
+                                    res.writeHead(pRes.statusCode, newHeaders);
+                                    pRes.on('data', (c) => {
+                                        let chunkStr = c.toString();
+                                        chunkStr = chunkStr.replace(/"model":\s*"[^"]+"/g, `"model":"${currentJson.model}"`);
+                                        res.write(chunkStr);
+                                    });
+                                    pRes.on('end', () => {
+                                        res.end();
+                                        resolve();
+                                    });
+                                    return;
+                                }
 
-                        if (!json.stream) {
-                            let resChunks = []; pRes.on('data', c => resChunks.push(c));
-                            pRes.on('end', () => {
-                                const data = Buffer.concat(resChunks).toString();
-                                try {
-                                    const resJson = normalizeResponseJson(JSON.parse(data));
-                                    const final = JSON.stringify(resJson);
-                                    const h = { ...pRes.headers }; delete h['content-length']; delete h['transfer-encoding'];
-                                    h['content-length'] = Buffer.byteLength(final);
-                                    res.writeHead(pRes.statusCode, h); res.end(final);
-                                } catch { res.writeHead(pRes.statusCode, pRes.headers); res.end(data); }
-                            });
-                        } else {
-                            res.writeHead(pRes.statusCode, pRes.headers);
-                            let textOut = '';
-                            createSseNormalizer(pRes, res, {
-                                onNormalizedEvent(norm) {
-                                    if (norm.type === 'response.output_text.delta') textOut += norm.delta;
-                                    if (norm.type === 'response.output_text.done') textOut = norm.text;
-                                    const itemText = norm.item?.content?.find?.(c => c.type === 'output_text')?.text;
-                                    if (itemText) textOut = itemText;
-                                },
-                                async onCompleted(comp) {
-                                    const out = comp.response?.output ?? [];
-                                    const finalEvt = normalizeResponseJson({ ...comp, response: { ...comp.response, output: out } });
-                                    res.write(`data: ${JSON.stringify(finalEvt)}\n\n`); res.end();
+                                if (!currentJson.stream) {
+                                    let resChunks = []; pRes.on('data', c => resChunks.push(c));
+                                    pRes.on('end', async () => {
+                                        const data = Buffer.concat(resChunks).toString();
+                                        try {
+                                            const resJson = normalizeResponseJson(JSON.parse(data));
+                                            
+                                            // Extraction for Recovery Logic
+                                            let content = '';
+                                            let hasToolCall = false;
+                                            let isFinished = false;
+
+                                            if (resJson.choices?.[0]) {
+                                                const choice = resJson.choices[0];
+                                                content = (typeof choice.message?.content === 'string' ? choice.message.content : 
+                                                          (Array.isArray(choice.message?.content) ? choice.message.content.map(c => c.text || '').join('') : ''));
+                                                hasToolCall = !!choice.message?.tool_calls?.length;
+                                                isFinished = choice.finish_reason === 'stop';
+                                            }
+                                            
+                                            const processOutputForRecovery = (output) => {
+                                                if (!Array.isArray(output)) return;
+                                                for (const item of output) {
+                                                    if (item.type === 'message') {
+                                                        content += (Array.isArray(item.content) ? item.content.map(c => c.text || '').join('') : '');
+                                                        if (item.tool_calls?.length) hasToolCall = true;
+                                                        if (item.status === 'completed') isFinished = true;
+                                                    }
+                                                    if (item.type === 'function_call') hasToolCall = true;
+                                                }
+                                            };
+
+                                            if (resJson.output) processOutputForRecovery(resJson.output);
+                                            if (resJson.response?.output) processOutputForRecovery(resJson.response.output);
+                                            
+                                            if (content.includes('FINISHED')) isFinished = true;
+                                            const isContentEmpty = !content.trim();
+
+                                                if (resJson.choices || resJson.output || resJson.response?.output) {
+                                                    if (isNonStop && isFinished && !hasToolCall && attempt < 3) {
+                                                        log(`[Proxy] Non-Stop: Model finished on port ${port}. Injecting follow-up (attempt ${attempt})...`);
+                                                        const nextJson = { ...currentJson };
+                                                        nextJson.input = [...(nextJson.input || []),
+                                                            { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: content }] },
+                                                            { type: 'message', role: 'user', content: [{ type: 'input_text', text: "Please continue with the next step. If the task is fully complete, provide a final summary of what was accomplished." }] }
+                                                        ];
+                                                        if (releaseBackend) { releaseBackend(); releaseBackend = null; }
+                                                        resolve(executeBackendRequest(nextJson, attempt + 1));
+                                                        return;
+                                                    }
+                                                    
+                                                    if (attempt < 3 && !hasToolCall && !isFinished && isContentEmpty) {
+                                                        log(`[Proxy] Recovery: Model stalled (no content, no tool call). Retrying (attempt ${attempt})...`);
+                                                        if (releaseBackend) { releaseBackend(); releaseBackend = null; }
+                                                        resolve(executeBackendRequest(currentJson, attempt + 1));
+                                                        return;
+                                                    }
+
+                                                    // Recovery Flow: Review prompt for non-streaming
+                                                    if (currentJson.tools?.length > 0 && !isNonStop && isFinished && !hasToolCall && attempt < 2 && content.length < 50) {
+                                                        log(`[Proxy] Recovery: Model finished without tool call and short content. Injecting review prompt...`);
+                                                        const nextJson = { ...currentJson };
+                                                        nextJson.input = [...(nextJson.input || []),
+                                                            { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: content }] },
+                                                            { type: 'message', role: 'user', content: [{ type: 'input_text', text: "You haven't called a tool yet. Please check the available tools and call the appropriate one to proceed." }] }
+                                                        ];
+                                                        if (releaseBackend) { releaseBackend(); releaseBackend = null; }
+                                                        resolve(executeBackendRequest(nextJson, attempt + 1));
+                                                        return;
+                                                    }
+                                                }
+
+                                            const final = JSON.stringify(resJson);
+                                            const h = { ...pRes.headers }; delete h['content-length']; delete h['transfer-encoding'];
+                                            h['content-length'] = Buffer.byteLength(final);
+                                            res.writeHead(pRes.statusCode, h); res.end(final);
+                                            resolve();
+                                        } catch (e) { 
+                                            error(`Error in non-stream response: ${e.message}`);
+                                            res.writeHead(pRes.statusCode, pRes.headers); res.end(data); 
+                                            resolve();
+                                        }
+                                    });
+                                } else {
+                                    if (attempt === 1) res.writeHead(pRes.statusCode, pRes.headers);
+                                    
+                                    let fullContent = '';
+                                    let lastFinishReason = null;
+                                    let hasSeenToolCall = false;
+
+                                    createSseNormalizer(pRes, res, {
+                                        onNormalizedEvent(norm) {
+                                            // Extract from choices
+                                            if (norm.choices?.[0]?.delta?.content) fullContent += norm.choices[0].delta.content;
+                                            if (norm.choices?.[0]?.delta?.tool_calls) hasSeenToolCall = true;
+                                            if (norm.choices?.[0]?.finish_reason) lastFinishReason = norm.choices[0].finish_reason;
+
+                                            // Extract from output array (top-level or nested)
+                                            const extract = (output) => {
+                                                if (!Array.isArray(output)) return;
+                                                for (const item of output) {
+                                                    if (item.type === 'message' && item.content) {
+                                                        fullContent += (Array.isArray(item.content) ? item.content.map(c => c.text || '').join('') : '');
+                                                        if (item.tool_calls?.length) hasSeenToolCall = true;
+                                                        if (item.status === 'completed') lastFinishReason = 'stop';
+                                                    }
+                                                    if (item.type === 'function_call') hasSeenToolCall = true;
+                                                }
+                                            };
+                                            extract(norm.output);
+                                            extract(norm.response?.output);
+
+                                            if (norm.type === 'response.completed' && norm.response?.status === 'completed') {
+                                                lastFinishReason = 'stop';
+                                            }
+                                        },
+                                        async onCompleted(comp) {
+                                            if (fullContent.includes('FINISHED')) lastFinishReason = 'stop';
+                                            
+                                            // Non-Stop Mode: If it finished with "stop" reason and no tool call, inject follow-up
+                                            if (isNonStop && lastFinishReason === 'stop' && !hasSeenToolCall && attempt < 3) {
+                                                log(`[Proxy] Non-Stop: Model finished stream on port ${port}. Injecting follow-up (attempt ${attempt})...`);
+                                                const nextJson = { ...currentJson };
+                                                nextJson.input = [...(nextJson.input || []),
+                                                    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: fullContent }] },
+                                                    { type: 'message', role: 'user', content: [{ type: 'input_text', text: "Please continue. What is the next logical action?" }] }
+                                                ];
+                                                if (releaseBackend) { log(`[Proxy] Releasing backend before recursive call`); releaseBackend(); releaseBackend = null; }
+                                                resolve(executeBackendRequest(nextJson, attempt + 1));
+                                                return;
+                                            }
+
+                                            // Recovery Flow: If it finished without a tool call but work is likely pending
+                                            if (currentJson.tools?.length > 0 && !isNonStop && lastFinishReason === 'stop' && !hasSeenToolCall && attempt < 2 && fullContent.length < 50) {
+                                                log(`[Proxy] Recovery: Model finished without tool call and short content. Injecting review prompt (attempt ${attempt})...`);
+                                                const nextJson = { ...currentJson };
+                                                nextJson.input = [...(nextJson.input || []),
+                                                    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: fullContent }] },
+                                                    { type: 'message', role: 'user', content: [{ type: 'input_text', text: "You haven't called a tool yet. Please check the available tools and call the appropriate one to proceed." }] }
+                                                ];
+                                                if (releaseBackend) { log(`[Proxy] Releasing backend before recursive call`); releaseBackend(); releaseBackend = null; }
+                                                resolve(executeBackendRequest(nextJson, attempt + 1));
+                                                return;
+                                            }
+                                            
+                                            // Fallback Injection: If all else fails and it's definitely stuck
+                                            if (lastFinishReason === 'stop' && !hasSeenToolCall && attempt >= 3) {
+                                                log(`[Proxy] Recovery: Model stuck after multiple attempts. Injecting fallback tool call (ls -F)...`);
+                                                const fallbackToolCall = {
+                                                    id: `call_${Date.now()}`,
+                                                    type: 'function',
+                                                    function: { name: 'bash', arguments: JSON.stringify({ command: 'ls -F' }) }
+                                                };
+                                                const injectEvt = {
+                                                    choices: [{
+                                                        delta: { tool_calls: [fallbackToolCall] },
+                                                        index: 0,
+                                                        finish_reason: 'tool_calls'
+                                                    }]
+                                                };
+                                                res.write(`data: ${JSON.stringify(injectEvt)}\n\n`);
+                                            }
+
+                                            log(`[Proxy] Finishing stream for port ${port} after attempt ${attempt}`);
+                                            res.write('data: [DONE]\n\n');
+                                            res.end();
+                                            resolve();
+                                        },
+                                        suppressDone: true // New option to prevent [DONE] until we are actually finished
+                                    });
                                 }
                             });
+                            pReq.on('error', reject);
+                            pReq.write(currentPatched);
+                            pReq.end();
+                        });
+                    }
+
+                    try {
+                        await executeBackendRequest(json);
+                    } catch (e) {
+                        cleanup();
+                        if (!res.headersSent) {
+                            res.writeHead(500);
+                            res.end(e.message);
                         }
-                    });
-                    pReq.write(patched); pReq.end();
+                    }
                 } catch (e) { cleanup(); res.writeHead(500); res.end(e.message); }
             });
             return;
@@ -857,8 +1191,24 @@ LISTEN_PORTS.forEach(port => {
 
 function restartLlamaService(name, port, reason) {
     log(`[Monitor] Restarting ${name} on port ${port}: ${reason}`);
-    exec(`sudo -n pkill -9 -f "port ${port}"; sudo -n systemctl restart ${name}`, (err) => {
-        if (!err) log(`[Monitor] ${name} restarted successfully.`);
+    
+    // We try multiple ways to restart the service:
+    // 1. systemctl --user (if it's a user service)
+    // 2. sudo -n systemctl (if it's a system service and we have NOPASSWD sudo)
+    // 3. pkill (as a fallback, if we have permission to kill the process)
+    
+    const cmd = `(systemctl --user restart ${name} 2>/dev/null) || ` +
+                `(sudo -n systemctl restart ${name} 2>/dev/null) || ` +
+                `(pkill -9 -f "port ${port}" 2>/dev/null && echo "Killed via pkill") || ` +
+                `(sudo -n pkill -9 -f "port ${port}" 2>/dev/null && echo "Killed via sudo pkill")`;
+
+    exec(cmd, (err, stdout, stderr) => {
+        if (err) {
+            error(`[Monitor] All restart attempts failed for ${name}: ${err.message}. Stderr: ${stderr}`);
+        } else {
+            const output = stdout.trim();
+            log(`[Monitor] ${name} restart command executed. ${output ? '(' + output + ')' : ''}`);
+        }
     });
 }
 
@@ -983,5 +1333,5 @@ const checkBackends = () => {
     BACKEND_PORTS.forEach(port => checkBackend(port));
 };
 
-setInterval(checkBackends, 60000);
-setTimeout(checkBackends, 1000); // Initial check shortly after startup
+setInterval(checkBackends, 60000).unref();
+setTimeout(checkBackends, 1000).unref(); // Initial check shortly after startup

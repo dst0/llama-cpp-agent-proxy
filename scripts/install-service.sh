@@ -6,8 +6,6 @@ SERVICE_NAME="${SERVICE_NAME:-llama-cpp-agent-proxy}"
 TARGET_HOST="${TARGET_HOST:-127.0.0.1}"
 TARGET_PORT="${TARGET_PORT:-11435}"
 BACKEND_PORTS="${BACKEND_PORTS:-$TARGET_PORT}"
-PORT="${PORT:-11437}"
-NON_STOP_MODE="${NON_STOP_MODE:-false}"
 MONITOR_ENABLED="${MONITOR_ENABLED:-true}"
 
 while [[ $# -gt 0 ]]; do
@@ -32,21 +30,14 @@ while [[ $# -gt 0 ]]; do
             BACKEND_SERVICES="$2"
             shift 2
             ;;
-        --port)
-            PORT="$2"
-            shift 2
-            ;;
-        --non-stop-mode)
-            NON_STOP_MODE="$2"
-            shift 2
-            ;;
+
         --monitor-enabled)
             MONITOR_ENABLED="$2"
             shift 2
             ;;
         -h|--help)
             cat <<EOF
-Usage: $(basename "$0") [--service-name NAME] [--target-host HOST] [--target-port PORT] [--backend-ports PORTS] [--port PORT] [--non-stop-mode MODE] [--monitor-enabled BOOL]
+Usage: $(basename "$0") [--service-name NAME] [--target-host HOST] [--target-port PORT] [--backend-ports PORTS] [--monitor-enabled BOOL]
 
 Installs a user service for the proxy on macOS (LaunchAgent) or Ubuntu/Linux (systemd user service).
 EOF
@@ -60,7 +51,11 @@ EOF
 done
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NODE_BIN="$(command -v node)"
+# Prefer stable fnm node path over shell-specific multishell path
+if [[ -d "${HOME}/.local/share/fnm/node-versions" ]]; then
+    NODE_BIN="$(ls -t ${HOME}/.local/share/fnm/node-versions/*/installation/bin/node 2>/dev/null | head -1)"
+fi
+NODE_BIN="${NODE_BIN:-$(command -v node)}"
 OS_NAME="$(uname -s)"
 SERVICE_UNIT="${SERVICE_NAME}.service"
 LABEL="com.github.${SERVICE_NAME}"
@@ -109,10 +104,6 @@ install_launchd() {
         <string>${BACKEND_PORTS}</string>
         <key>BACKEND_SERVICES</key>
         <string>${BACKEND_SERVICES:-llama-server}</string>
-        <key>PORT</key>
-        <string>${PORT}</string>
-        <key>NON_STOP_MODE</key>
-        <string>${NON_STOP_MODE}</string>
         <key>MONITOR_ENABLED</key>
         <string>${MONITOR_ENABLED}</string>
     </dict>
@@ -158,8 +149,6 @@ Environment=TARGET_HOST=${TARGET_HOST}
 Environment=TARGET_PORT=${TARGET_PORT}
 Environment=BACKEND_PORTS=${BACKEND_PORTS}
 Environment=BACKEND_SERVICES=${BACKEND_SERVICES:-llama-server}
-Environment=PORT=${PORT}
-Environment=NON_STOP_MODE=${NON_STOP_MODE}
 Environment=MONITOR_ENABLED=${MONITOR_ENABLED}
 ExecStart=${NODE_BIN} ${ROOT_DIR}/index.js
 Restart=on-failure

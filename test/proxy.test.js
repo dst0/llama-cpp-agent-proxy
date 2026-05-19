@@ -25,6 +25,7 @@ async function startProxy(envOverrides = {}, proxyPort, targetPort) {
                 MONITOR_ENABLED: 'false',
                 TITLE_MODEL: 'none', // Disable title generation in tests
                 LOG_FILE: TEST_LOG_FILE,
+                CONFIG_PATH: path.join(os.tmpdir(), `proxy-${proxyPortStr}.toml`),
                 STATUS_FILE: path.join(os.tmpdir(), `proxy-${proxyPortStr}.status`),
                 ...envOverrides
             }
@@ -64,7 +65,7 @@ function requestProxy({ path: requestPath, method, body, headers, timeout = 0 },
             port: proxyPort,
             path: requestPath,
             method,
-            headers
+            headers: { ...headers, 'connection': 'close' }
         });
 
         if (timeout > 0) {
@@ -110,20 +111,24 @@ function startMockServer(onReq, port = null) {
 
 async function runTest(name, fn) {
     test(name, async (t) => {
-        console.log(`\n[TEST START] ${name}`);
         const state = { mockServers: [], proxy: null, getProxyLogs: null };
 
-        const cleanup = async () => {
+        t.after(async () => {
             if (state.proxy) {
                 try { state.proxy.kill('SIGKILL'); } catch {}
             }
             for (const ms of state.mockServers) {
-                try { ms.server.close(); } catch {}
+                try { 
+                    await new Promise((resolve) => {
+                        ms.server.close(resolve);
+                        setTimeout(() => { ms.server.closeAllConnections?.(); resolve(); }, 200).unref();
+                    });
+                } catch {}
             }
-        };
+        });
 
         try {
-            await fn({ state, cleanup });
+            await fn({ state });
         } catch (e) {
             if (state.getProxyLogs) {
                 const logs = state.getProxyLogs();
@@ -131,13 +136,11 @@ async function runTest(name, fn) {
                 console.error(`[Proxy Stderr]\n${logs.stderr}`);
             }
             throw e;
-        } finally {
-            await cleanup();
         }
     });
 }
 
-runTest('Proxy should flatten tool calls', async ({ state, cleanup }) => {
+runTest('Proxy should flatten tool calls', async ({ state }) => {
     let receivedBody = null;
     const mockUpstream = await startMockServer((req, res) => {
         let chunks = [];
@@ -180,7 +183,7 @@ runTest('Proxy should flatten tool calls', async ({ state, cleanup }) => {
     assert.strictEqual(receivedBody.tools[0].function, undefined);
 });
 
-runTest('Proxy should handle streaming', async ({ state, cleanup }) => {
+runTest('Proxy should handle streaming', async ({ state }) => {
     const mockUpstream = await startMockServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
         res.write('data: {"text": "Hello"}\n\n');
@@ -206,7 +209,7 @@ runTest('Proxy should handle streaming', async ({ state, cleanup }) => {
     assert.ok(response.body.includes('World'));
 });
 
-runTest('Proxy should normalize tool outputs for llama-server', async ({ state, cleanup }) => {
+runTest('Proxy should normalize tool outputs for llama-server', async ({ state }) => {
     let receivedBody = null;
     const mockUpstream = await startMockServer((req, res) => {
         let chunks = [];
@@ -256,7 +259,7 @@ runTest('Proxy should normalize tool outputs for llama-server', async ({ state, 
     });
 });
 
-runTest('Proxy should preserve input_text parts for llama-server', async ({ state, cleanup }) => {
+runTest('Proxy should preserve input_text parts for llama-server', async ({ state }) => {
     let receivedBody = null;
     const mockUpstream = await startMockServer((req, res) => {
         const chunks = [];
@@ -293,7 +296,7 @@ runTest('Proxy should preserve input_text parts for llama-server', async ({ stat
     ]);
 });
 
-runTest('Proxy should preserve function_call items for llama-server', async ({ state, cleanup }) => {
+runTest('Proxy should preserve function_call items for llama-server', async ({ state }) => {
     let receivedBody = null;
     const mockUpstream = await startMockServer((req, res) => {
         const chunks = [];
@@ -335,7 +338,7 @@ runTest('Proxy should preserve function_call items for llama-server', async ({ s
     });
 });
 
-runTest('Proxy should drop reasoning-only assistant turns before forwarding', async ({ state, cleanup }) => {
+runTest('Proxy should drop reasoning-only assistant turns before forwarding', async ({ state }) => {
     let receivedBody = null;
     const mockUpstream = await startMockServer((req, res) => {
         const chunks = [];
@@ -380,7 +383,7 @@ runTest('Proxy should drop reasoning-only assistant turns before forwarding', as
     ]);
 });
 
-runTest('Proxy should normalize streaming assistant content', async ({ state, cleanup }) => {
+runTest('Proxy should normalize streaming assistant content', async ({ state }) => {
     const mockUpstream = await startMockServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'text/event-stream' });
         res.write('data: ' + JSON.stringify({
@@ -417,7 +420,7 @@ runTest('Proxy should normalize streaming assistant content', async ({ state, cl
     assert.ok(!response.body.includes('reasoning_text'));
 });
 
-runTest('Proxy should normalize input images for llama-server', async ({ state, cleanup }) => {
+runTest('Proxy should normalize input images for llama-server', async ({ state }) => {
     let receivedBody = null;
     const mockUpstream = await startMockServer((req, res) => {
         let chunks = [];
@@ -458,7 +461,7 @@ runTest('Proxy should normalize input images for llama-server', async ({ state, 
     ]);
 });
 
-runTest('Proxy should preserve assistant output text for llama-server', async ({ state, cleanup }) => {
+runTest('Proxy should preserve assistant output text for llama-server', async ({ state }) => {
     let receivedBody = null;
     const mockUpstream = await startMockServer((req, res) => {
         let chunks = [];
@@ -501,7 +504,7 @@ runTest('Proxy should preserve assistant output text for llama-server', async ({
     ]);
 });
 
-runTest('Proxy should strip reasoning outputs', async ({ state, cleanup }) => {
+runTest('Proxy should strip reasoning outputs', async ({ state }) => {
     const mockUpstream = await startMockServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -547,7 +550,7 @@ runTest('Proxy should strip reasoning outputs', async ({ state, cleanup }) => {
     ]);
 });
 
-runTest('Proxy should preserve reasoning-only outputs', async ({ state, cleanup }) => {
+runTest('Proxy should preserve reasoning-only outputs', async ({ state }) => {
     const mockUpstream = await startMockServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -585,7 +588,7 @@ runTest('Proxy should preserve reasoning-only outputs', async ({ state, cleanup 
     ]);
 });
 
-runTest('Proxy should normalize assistant response content', async ({ state, cleanup }) => {
+runTest('Proxy should normalize assistant response content', async ({ state }) => {
     const mockUpstream = await startMockServer((req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
@@ -624,7 +627,7 @@ runTest('Proxy should normalize assistant response content', async ({ state, cle
     ]);
 });
 
-runTest('Proxy should inject model metadata', async ({ state, cleanup }) => {
+runTest('Proxy should inject model metadata', async ({ state }) => {
     const mockUpstream = await startMockServer((req, res) => {
         if (req.url === '/v1/models') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -653,7 +656,7 @@ runTest('Proxy should inject model metadata', async ({ state, cleanup }) => {
     assert.strictEqual(model.name, 'test-model');
 });
 
-runTest('Proxy should handle stalled upstream props requests', async ({ state, cleanup }) => {
+runTest('Proxy should handle stalled upstream props requests', async ({ state }) => {
     const mockUpstream = await startMockServer((req, res) => {
         if (req.url === '/v1/models') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -685,7 +688,7 @@ runTest('Proxy should handle stalled upstream props requests', async ({ state, c
     assert.strictEqual(json.models[0].name, 'test-model');
 });
 
-runTest('Proxy should honor LOG_FILE without logging request content', async ({ state, cleanup }) => {
+runTest('Proxy should honor LOG_FILE without logging request content', async ({ state }) => {
     const logFile = path.join(os.tmpdir(), `llama-cpp-agent-proxy-log-${process.pid}-${Date.now()}.log`);
     const mockUpstream = await startMockServer((req, res) => {
         let chunks = [];
@@ -722,7 +725,7 @@ runTest('Proxy should honor LOG_FILE without logging request content', async ({ 
     fs.rmSync(logFile, { force: true });
 });
 
-runTest('Proxy should inject follow-up tool call when agentic response has text but no tool call', async ({ state, cleanup }) => {
+runTest('Proxy should inject follow-up tool call when agentic response has text but no tool call', async ({ state }) => {
     let upstreamCallCount = 0;
     const mockUpstream = await startMockServer((req, res) => {
         let chunks = [];
@@ -776,11 +779,11 @@ runTest('Proxy should inject follow-up tool call when agentic response has text 
     }, proxyPort);
 
     assert.strictEqual(upstreamCallCount, 2);
-    assert.ok(response.body.includes('response.output_item.added'));
+    assert.ok(response.body.includes('response.completed'));
     assert.ok(response.body.includes('"shell"'));
 });
 
-runTest('Proxy should not inject follow-up when response already has a tool call', async ({ state, cleanup }) => {
+runTest('Proxy should not inject follow-up when response already has a tool call', async ({ state }) => {
     let upstreamCallCount = 0;
     const mockUpstream = await startMockServer((req, res) => {
         let chunks = [];
@@ -819,7 +822,7 @@ runTest('Proxy should not inject follow-up when response already has a tool call
     assert.strictEqual(upstreamCallCount, 1);
 });
 
-runTest('Proxy should not inject follow-up when no tools are registered', async ({ state, cleanup }) => {
+runTest('Proxy should not inject follow-up when no tools are registered', async ({ state }) => {
     let upstreamCallCount = 0;
     const mockUpstream = await startMockServer((req, res) => {
         let chunks = [];
@@ -857,7 +860,7 @@ runTest('Proxy should not inject follow-up when no tools are registered', async 
     assert.strictEqual(upstreamCallCount, 1);
 });
 
-runTest('Proxy should not inject follow-up when model replies FINISHED', async ({ state, cleanup }) => {
+runTest('Proxy should not inject follow-up when model replies FINISHED', async ({ state }) => {
     let upstreamCallCount = 0;
     const mockUpstream = await startMockServer((req, res) => {
         let chunks = [];

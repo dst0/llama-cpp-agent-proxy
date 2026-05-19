@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { exec } from 'node:child_process';
 import http from 'node:http';
+import path from 'node:path';
 
 const ENV_FILE = '/etc/llama/llama-server-main.env';
 

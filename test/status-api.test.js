@@ -6,12 +6,13 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import os from 'node:os';
 import fs from 'node:fs';
+import { getAvailablePort } from './helpers.js';
 
 const PROXY_PATH = path.resolve('index.js');
 
 test('Proxy /v1/status API endpoint', async (t) => {
-    const proxyPort = 11440;
-    const targetPort = 11441;
+    const proxyPort = await getAvailablePort();
+    const targetPort = await getAvailablePort();
     const statusFile = path.join(os.tmpdir(), `test-proxy-${proxyPort}.status`);
     
     if (fs.existsSync(statusFile)) fs.unlinkSync(statusFile);
@@ -52,7 +53,7 @@ test('Proxy /v1/status API endpoint', async (t) => {
 
     await t.test('returns status as JSON', async () => {
         const res = await new Promise((resolve) => {
-            http.get(`http://127.0.0.1:${proxyPort}/v1/status`, resolve);
+            http.get(`http://127.0.0.1:${proxyPort}/v1/status`, { headers: { 'connection': 'close' } }, resolve);
         });
 
         assert.strictEqual(res.statusCode, 200);

@@ -41,7 +41,7 @@ The proxy supports routing to specialized backends:
     - **Execution**: Full GPU (Vulkan/ROCm)
     - **Optimized**: 64k Context window with `iq4_nl` KV cache quantization to fit 27B+ models in 16GB VRAM.
 2.  **Micro Model (`lms-micro`)**:
-    - **Port**: `11438`
+    - **Port**: `1234`
     - **Execution**: Strict CPU (AVX2) using `--n-gpu-layers 0`.
     - **Optimized**: Fast, low-latency responses for simple tasks.
 
@@ -99,13 +99,16 @@ To uninstall backends:
 sudo bash scripts/uninstall-llama-services.sh
 ```
 
-### 2. Install Proxy Services
+### 2. Install Proxy Service
 
-Install both the Standard and Non-Stop proxy instances as persistent background services:
+Install the unified proxy service (manages both Standard and Non-Stop ports from a single process):
 
 ```bash
-bash scripts/install-two-services.sh
+bash scripts/install-service.sh
 ```
+
+The proxy reads its port configuration from `~/.llama-cpp-agent-proxy/config.toml`.
+By default it binds to ports `11450` (Standard) and `11451` (Non-Stop).
 
 ### 3. Usage
 
@@ -113,25 +116,30 @@ Point your agents to the desired proxy:
 - **Non-stop agent**: `http://localhost:11451/v1`
 - **Standard agent**: `http://localhost:11450/v1`
 
-## Environment Variables
+## Configuration
 
-The proxy supports the following variables (configured automatically by the scripts, or via `.env` file):
+The proxy reads its configuration from `~/.llama-cpp-agent-proxy/config.toml` on startup and reloads it every minute. Environment variables override config file values.
 
-- `BACKEND_PORTS` — Comma-separated list of upstream ports (default: `11435,11438`).
+### Environment Variables
+
+- `BACKEND_PORTS` — Comma-separated list of upstream ports (default: `11435,1234`).
 - `BACKEND_SERVICES` — Comma-separated list of systemd service names for monitoring (default: `llama-server-main,lms-micro`).
-- `PORT` — Port the proxy listens on (e.g., `11450` or `11451`).
-- `NON_STOP_MODE` — When `true`, enables the "never finished" agentic behavior.
+- `TARGET_HOST` — Host of the primary backend (default: `127.0.0.1`).
+- `TARGET_PORT` — Port of the primary backend (default: `11435`).
 - `MONITOR_ENABLED` — Enables background liveness monitoring and auto-restarts (default: `true`).
 - `LOG_DIR` — Directory for logs (default: `/home/dst/.llama-cpp-agent-proxy/logs`).
 - `LOG_FILE` — Path to concise log file (default: `proxy.log` in `LOG_DIR`).
+- `CONFIG_PATH` — Override the default config file path.
+
+> **Ports are configured in `config.toml`** — the `[network].ports` and `[network].non_stop_ports` arrays define which ports the proxy binds to. No `PORT` or `NON_STOP_MODE` environment variables are needed.
 
 ### Busy Redirect (MLX Backend Fallback)
 
 When the main llama-server is busy (already handling a request), the proxy can redirect to an MLX backend on a separate machine:
 
-- `BUSY_REDIRECT_HOST` — Host of the MLX redirect server (default: `192.168.8.124`).
+- `BUSY_REDIRECT_HOST` — Host of the MLX redirect server (default: `192.168.8.234`).
 - `BUSY_REDIRECT_PORT` — Port of the MLX redirect server (default: `1234`).
-- `BUSY_REDIRECT_MODEL` — Model name to use on the redirect server (default: `mtplx-qwen36-27b-optimized-speed`).
+- `BUSY_REDIRECT_MODEL` — Model name to use on the redirect server (default: `gemma-4-26b-a4b-it-mlx`).
 - `BUSY_REDIRECT_API_KEY` — Bearer API key for the redirect server (required if the server enforces auth).
 
 ### .env File
