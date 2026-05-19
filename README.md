@@ -31,7 +31,7 @@ The proxy provides a unified status API and SSE stream:
 
 ### Loop Integrity (Multi-stage Recovery)
 
-In **both modes**, if a model fails to call a tool while work is still pending (and hasn't signaled `FINISHED` in Standard Mode), the proxy initiates a recovery flow:
+In **all modes**, if a model fails to call a tool while work is still pending (and hasn't signaled `FINISHED` in Standard Mode), the proxy initiates a recovery flow:
   1. **Retry**: Resends the original prompt to give the model a second chance.
   2. **Review**: Asks the model to review its response and explicitly call a tool.
   3. **Injection**: If all else fails, proactively injects a fallback tool call (e.g., `ls -F`) with a valid `call_id` and reasoning to prevent the agentic loop from stalling.
