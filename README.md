@@ -65,15 +65,23 @@ ports = [11435, 1234]
 services = ["llama-server-main", "lms-micro"]
 monitor_enabled = true
 
-[redirect]
+[[redirects]]
 host = "192.168.8.234"
 port = 1234
-model = "gemma-4-26b-a4b-it-mlx"
+model = "gemma-4-e4b-it-mlx@4bit"
+api_key = ""
+
+[[redirects]]
+host = "192.168.8.47"
+port = 11434
+model = "qwen3.6-27b-mtp-ud"
 api_key = ""
 
 [logging]
 dir = "/home/dst/.llama-cpp-agent-proxy/logs"
 ```
+
+The proxy will automatically prefer the available redirect server with the **largest model** (heuristic based on parameter count in model name, e.g., "70b" > "8b").
 
 ## Quick Start
 

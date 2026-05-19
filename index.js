@@ -28,12 +28,15 @@ const TITLE_MODEL = process.env.TITLE_MODEL || 'qwen2.5-0.5b';
 
 // Global mutable config state
 let configState = {
-    redirect: {
-        host: process.env.BUSY_REDIRECT_HOST || '192.168.8.234',
-        port: parseInt(process.env.BUSY_REDIRECT_PORT || '1234'),
-        model: process.env.BUSY_REDIRECT_MODEL || 'gemma-4-26b-a4b-it-mlx',
-        api_key: process.env.BUSY_REDIRECT_API_KEY || ''
-    },
+    redirects: [
+        {
+            host: process.env.BUSY_REDIRECT_HOST || '192.168.8.234',
+            port: parseInt(process.env.BUSY_REDIRECT_PORT || '1234'),
+            model: process.env.BUSY_REDIRECT_MODEL || 'gemma-4-e4b-it-mlx@4bit',
+            api_key: process.env.BUSY_REDIRECT_API_KEY || '',
+            available: false
+        }
+    ],
     backends: {
         monitor_enabled: process.env.MONITOR_ENABLED !== 'false'
     }
@@ -56,7 +59,7 @@ function error(msg) { console.error(msg); writeLog(LOG_FILE, `ERROR: ${msg}`); }
 // 4. Configuration Loader
 function loadConfig() {
     try {
-        const isFirstLoad = !configState.redirect.host; // rough check
+        const isFirstLoad = configState.redirects.length === 0 || !configState.redirects[0].host; // rough check
         if (!fs.existsSync(CONFIG_PATH)) {
             const defaultConfig = {
                 network: {
@@ -70,16 +73,21 @@ function loadConfig() {
                     services: ["llama-server-main", "lms-micro"],
                     monitor_enabled: configState.backends.monitor_enabled
                 },
-                redirect: configState.redirect,
+                redirects: configState.redirects.map(r => ({ host: r.host, port: r.port, model: r.model, api_key: r.api_key })),
                 logging: {
                     dir: LOG_DIR
                 }
             };
-            const tomlStr = `# llama-cpp-agent-proxy configuration\n\n` + 
+            
+            let tomlStr = `# llama-cpp-agent-proxy configuration\n\n` + 
                 `[network]\ntarget_host = "${defaultConfig.network.target_host}"\ntarget_port = ${defaultConfig.network.target_port}\nports = ${JSON.stringify(defaultConfig.network.ports)}\nnon_stop_ports = ${JSON.stringify(defaultConfig.network.non_stop_ports)}\n\n` +
-                `[backends]\nports = ${JSON.stringify(defaultConfig.backends.ports)}\nservices = ${JSON.stringify(defaultConfig.backends.services)}\nmonitor_enabled = ${defaultConfig.backends.monitor_enabled}\n\n` +
-                `[redirect]\nhost = "${defaultConfig.redirect.host}"\nport = ${defaultConfig.redirect.port}\nmodel = "${defaultConfig.redirect.model}"\napi_key = "${defaultConfig.redirect.api_key}"\n\n` +
-                `[logging]\ndir = "${defaultConfig.logging.dir}"\n`;
+                `[backends]\nports = ${JSON.stringify(defaultConfig.backends.ports)}\nservices = ${JSON.stringify(defaultConfig.backends.services)}\nmonitor_enabled = ${defaultConfig.backends.monitor_enabled}\n\n`;
+            
+            defaultConfig.redirects.forEach(r => {
+                tomlStr += `[[redirects]]\nhost = "${r.host}"\nport = ${r.port}\nmodel = "${r.model}"\napi_key = "${r.api_key}"\n\n`;
+            });
+
+            tomlStr += `[logging]\ndir = "${defaultConfig.logging.dir}"\n`;
             
             fs.mkdirSync(path.dirname(CONFIG_PATH), { recursive: true });
             fs.writeFileSync(CONFIG_PATH, tomlStr);
@@ -95,12 +103,30 @@ function loadConfig() {
             TARGET_HOST = parsed.network.target_host || TARGET_HOST;
             TARGET_PORT = parsed.network.target_port || TARGET_PORT;
         }
-        if (parsed.redirect) {
-            configState.redirect.host = parsed.redirect.host || configState.redirect.host;
-            configState.redirect.port = parsed.redirect.port || configState.redirect.port;
-            configState.redirect.model = parsed.redirect.model || configState.redirect.model;
-            configState.redirect.api_key = parsed.redirect.api_key || configState.redirect.api_key;
+        
+        if (parsed.redirects && Array.isArray(parsed.redirects)) {
+            // Merge existing availability into reloaded config
+            configState.redirects = parsed.redirects.map(r => {
+                const existing = configState.redirects.find(er => er.host === r.host && er.port === r.port);
+                return {
+                    host: r.host,
+                    port: r.port,
+                    model: r.model,
+                    api_key: r.api_key || '',
+                    available: existing ? existing.available : false
+                };
+            });
+        } else if (parsed.redirect) {
+            // Legacy single redirect support
+            configState.redirects = [{
+                host: parsed.redirect.host,
+                port: parsed.redirect.port,
+                model: parsed.redirect.model,
+                api_key: parsed.redirect.api_key || '',
+                available: configState.redirects[0]?.available || false
+            }];
         }
+
         if (parsed.backends && typeof parsed.backends.monitor_enabled === 'boolean') {
             configState.backends.monitor_enabled = parsed.backends.monitor_enabled;
         }
@@ -119,11 +145,21 @@ loadConfig();
 setInterval(loadConfig, 60000);
 
 // Use configState for derived values
-const getBusyRedirectHost = () => configState.redirect.host;
-const getBusyRedirectPort = () => configState.redirect.port;
-const getBusyRedirectModel = () => configState.redirect.model;
-const getBusyRedirectApiKey = () => configState.redirect.api_key;
+const getRedirects = () => configState.redirects;
 const isMonitorEnabled = () => configState.backends.monitor_enabled;
+
+function getModelSize(modelName) {
+    const match = modelName.match(/(\d+\.?\d*)[bB]/);
+    return match ? parseFloat(match[1]) : 0;
+}
+
+function pickBestRedirect() {
+    const available = configState.redirects.filter(r => r.available);
+    if (available.length === 0) return null;
+    
+    // Sort by model size descending
+    return available.sort((a, b) => getModelSize(b.model) - getModelSize(a.model))[0];
+}
 
 // Backend config: host:port:service:logFile (logFile optional)
 const BACKEND_CONFIGS = (process.env.BACKEND_CONFIGS || `${TARGET_HOST}:${TARGET_PORT}:llama-server:/opt/llama/logs/main-stderr.log`).split(',').map(entry => {
@@ -138,7 +174,6 @@ const BACKEND_LOG_FILES = BACKEND_CONFIGS.map(b => b.logFile || '');
 
 let lastTitle = 'Idle';
 let lastTitleText = '';
-let redirectServerAvailable = false;
 let activeRedirectRequests = 0;
 const activeRequestsPerPort = new Map();
 const backendHTTPActivity = new Map();
@@ -313,6 +348,7 @@ function getStatus() {
         return { 
             ...b, 
             status, 
+            display: `${b.host} → ${b.model || 'None'}`,
             progress: b.progress !== undefined ? b.progress : (status === 'PREFILL' ? 0 : undefined),
             prefill_percent: b.progress !== undefined ? Math.round(b.progress * 100) : (status === 'PREFILL' ? 0 : undefined),
             active_count: q?.activeCount || 0,
@@ -339,6 +375,8 @@ function getStatus() {
         if (p !== 'all') totalQueueSize += q.size;
     });
 
+    const bestRedirect = pickBestRedirect();
+
     return {
         active_requests: Array.from(activeRequestsPerPort.values()).reduce((a, b) => a + b, 0),
         queue_size: totalQueueSize,
@@ -349,13 +387,21 @@ function getStatus() {
             active_count: virtualQueue.activeCount,
             max_parallel: virtualQueue.maxParallel 
         },
-        redirect_server: {
-            host: getBusyRedirectHost(),
-            port: getBusyRedirectPort(),
-            model: getBusyRedirectModel(),
-            available: redirectServerAvailable,
+        redirect_server: bestRedirect ? {
+            host: bestRedirect.host,
+            port: bestRedirect.port,
+            model: bestRedirect.model,
+            display: `${bestRedirect.host} → ${bestRedirect.model}`,
+            available: true,
             active_requests: activeRedirectRequests
-        },
+        } : { available: false },
+        redirects: configState.redirects.map(r => ({ 
+            host: r.host, 
+            port: r.port, 
+            model: r.model, 
+            display: `${r.host} → ${r.model}`,
+            available: r.available 
+        })),
         ports: portsStatus,
         queues: queuesStatus,
         last_title: lastTitle,
@@ -523,6 +569,7 @@ function createRequestHandler(port, isNonStop) {
         let decremented = false;
         let releaseBackend = null;
         let isRedirect = false;
+        let currentRedirect = null;
         let markFinished = () => {};
         let cleanup = () => {
             if (!decremented) {
@@ -568,7 +615,9 @@ function createRequestHandler(port, isNonStop) {
             delete cleanHeaders['transfer-encoding']; delete cleanHeaders['connection'];
             const { headers: extraHeaders = {}, ...rest } = options;
             
-            if (isRedirect && getBusyRedirectApiKey()) extraHeaders['Authorization'] = `Bearer ${getBusyRedirectApiKey()}`;
+            if (isRedirect && currentRedirect?.api_key) {
+                extraHeaders['Authorization'] = `Bearer ${currentRedirect.api_key}`;
+            }
             
             const pReq = http.request({
                 hostname: actualHost, port: actualPort, path: req.url, method: req.method,
@@ -685,11 +734,15 @@ function createRequestHandler(port, isNonStop) {
                                 // Trigger immediate status refresh after switch
                                 if (typeof checkBackend === 'function') checkBackend(tPort);
                             }
-                        } else if (tPort === TARGET_PORT && (backendQueues.get(tPort)?.activeCount >= backendQueues.get(tPort)?.maxParallel) && redirectServerAvailable) {
-                            log(`[Proxy] Main server busy (${backendQueues.get(tPort).activeCount}/${backendQueues.get(tPort).maxParallel}), redirecting to MLX: ${getBusyRedirectHost()}`);
-                            tPort = getBusyRedirectPort(); tHost = getBusyRedirectHost(); json.model = getBusyRedirectModel(); isRedirect = true;
-                            activeRedirectRequests++;
-                            updateStatusFile();
+                        } else if (tPort === TARGET_PORT && (backendQueues.get(tPort)?.activeCount >= backendQueues.get(tPort)?.maxParallel)) {
+                            const bestRedirect = pickBestRedirect();
+                            if (bestRedirect) {
+                                log(`[Proxy] Main server busy (${backendQueues.get(tPort).activeCount}/${backendQueues.get(tPort).maxParallel}), redirecting to MLX: ${bestRedirect.host}`);
+                                currentRedirect = bestRedirect;
+                                tPort = bestRedirect.port; tHost = bestRedirect.host; json.model = bestRedirect.model; isRedirect = true;
+                                activeRedirectRequests++;
+                                updateStatusFile();
+                            }
                         }
                     }
 
@@ -909,25 +962,23 @@ const checkBackend = (port) => {
 };
 
 const checkBackends = () => {
-    // Check Redirect Server
-    const rHost = getBusyRedirectHost();
-    const rPort = getBusyRedirectPort();
-    if (rHost && rPort) {
-        const checkReq = http.get({ hostname: rHost, port: rPort, path: '/v1/models', timeout: 5000 }, (res) => {
-            redirectServerAvailable = (res.statusCode === 200);
+    // Check Redirect Servers
+    configState.redirects.forEach(r => {
+        const checkReq = http.get({ hostname: r.host, port: r.port, path: '/v1/models', timeout: 5000 }, (res) => {
+            r.available = (res.statusCode === 200);
             updateStatusFile();
-            res.resume(); // consume the response
+            res.resume();
         });
-        checkReq.on('error', (err) => {
-            redirectServerAvailable = false;
+        checkReq.on('error', () => {
+            r.available = false;
             updateStatusFile();
         });
         checkReq.on('timeout', () => {
             checkReq.destroy();
-            redirectServerAvailable = false;
+            r.available = false;
             updateStatusFile();
         });
-    }
+    });
 
     BACKEND_PORTS.forEach(port => checkBackend(port));
 };
