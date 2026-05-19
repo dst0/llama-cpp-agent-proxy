@@ -31,7 +31,7 @@ let configState = {
     redirect: {
         host: process.env.BUSY_REDIRECT_HOST || '192.168.8.234',
         port: parseInt(process.env.BUSY_REDIRECT_PORT || '1234'),
-        model: process.env.BUSY_REDIRECT_MODEL || 'gemma-4-e4b-it-mlx@4bit',
+        model: process.env.BUSY_REDIRECT_MODEL || 'gemma-4-26b-a4b-it-mlx',
         api_key: process.env.BUSY_REDIRECT_API_KEY || ''
     },
     backends: {
