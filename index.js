@@ -913,11 +913,24 @@ function createRequestHandler(port, isNonStop, isEnforced) {
                                 const switchSuccess = await switchModel(json.model, tPort, log);
                                 if (!switchSuccess) {
                                     error(`[Proxy] Failed to switch to model ${json.model}`);
-                                    // If switch failed, we should probably not proceed with a stale model
-                                    res.writeHead(503, { 'Content-Type': 'application/json' });
-                                    res.end(JSON.stringify({ error: "Model switch failed", model: json.model }));
-                                    if (releaseBackend) releaseBackend();
-                                    return;
+                                    // Try redirect backend as fallback before giving up
+                                    const fallbackRedirect = pickBestRedirect();
+                                    if (fallbackRedirect) {
+                                        log(`[Proxy] Model switch failed, falling back to MLX redirect: ${fallbackRedirect.host}`);
+                                        currentRedirect = fallbackRedirect;
+                                        tPort = fallbackRedirect.port; tHost = fallbackRedirect.host;
+                                        json.model = fallbackRedirect.model; isRedirect = true;
+                                        const key = `${fallbackRedirect.host}:${fallbackRedirect.port}:${fallbackRedirect.model}`;
+                                        activeRedirectRequestsPerTarget.set(key, (activeRedirectRequestsPerTarget.get(key) || 0) + 1);
+                                        updateStatusFile();
+                                        if (releaseBackend) { releaseBackend(); releaseBackend = null; }
+                                    } else {
+                                        // No fallback available — return 503
+                                        res.writeHead(503, { 'Content-Type': 'application/json' });
+                                        res.end(JSON.stringify({ error: "Model switch failed", model: json.model }));
+                                        if (releaseBackend) releaseBackend();
+                                        return;
+                                    }
                                 }
                                 // Trigger immediate status refresh after switch
                                 if (typeof checkBackend === 'function') checkBackend(tPort);
@@ -985,6 +998,9 @@ function createRequestHandler(port, isNonStop, isEnforced) {
                     async function executeBackendRequest(currentJson, attempt = 1) {
                         const currentPatched = Buffer.from(JSON.stringify(currentJson));
                         const pReq = createProxyReq({ headers: { 'content-length': currentPatched.length } }, tPort, tHost);
+                        
+                        // Abort upstream if client disconnects — prevents wasting backend resources
+                        res.on('close', () => { if (!pReq.destroyed) pReq.destroy(); });
                         
                         return new Promise((resolve, reject) => {
                             pReq.on('response', (pRes) => {
@@ -1364,7 +1380,7 @@ const checkBackend = (port) => {
         });
     }).on('error', () => {});
 
-    http.get({ hostname: TARGET_HOST, port, path: '/health', timeout: 10000 }, (res) => {
+    http.get({ hostname: TARGET_HOST, port, path: '/health', timeout: 15000 }, (res) => {
         const b = backendStatuses.find(b => b.port === port);
         if (b) {
             if (res.statusCode === 200) {
@@ -1377,7 +1393,7 @@ const checkBackend = (port) => {
                 b.progress = undefined;
                 // Only restart if it was ready recently or if it's been in error state for a long time
                 const lastReady = lastReadyTime.get(port) || 0;
-                if (isMonitorEnabled() && (Date.now() - lastReady > 60000)) {
+                if (isMonitorEnabled() && (Date.now() - lastReady > 120000)) {
                     restartLlamaService(name, port, `Health status ${res.statusCode}`);
                 }
             }
@@ -1399,7 +1415,7 @@ const checkBackend = (port) => {
             if (isMonitorEnabled()) {
                 if (wasReady) {
                     restartLlamaService(name, port, err.message);
-                } else if (lastReady > 0 && timeSinceReady > 120000) {
+                } else if (lastReady > 0 && timeSinceReady > 300000) {
                     restartLlamaService(name, port, `Stuck for ${Math.round(timeSinceReady/1000)}s: ${err.message}`);
                 }
             }
