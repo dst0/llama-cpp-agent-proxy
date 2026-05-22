@@ -55,14 +55,24 @@ const FULL_LOG_FILE = (process.env.FULL_LOG_FILE || `${LOG_DIR}/proxy-full.log`)
 const STATUS_FILE = (process.env.STATUS_FILE || `${LOG_DIR}/proxy.status`).replace('~', process.env.HOME || '');
 const TITLE_MODEL = process.env.TITLE_MODEL || 'qwen2.5-0.5b';
 
+// Default max response tokens (4k). Override via env or config.toml [network].max_response_tokens
+let MAX_RESPONSE_TOKENS = parseInt(process.env.MAX_RESPONSE_TOKENS || '4096', 10);
+
 // Global mutable config state
 let configState = {
     redirects: [
         {
-            host: process.env.BUSY_REDIRECT_HOST || '192.168.8.234',
-            port: parseInt(process.env.BUSY_REDIRECT_PORT || '1234'),
-            model: process.env.BUSY_REDIRECT_MODEL || 'gemma-4-e4b-it-mlx@4bit',
-            api_key: process.env.BUSY_REDIRECT_API_KEY || '',
+            host: '192.168.8.47',
+            port: parseInt('11434'),
+            model: 'qwen3.6-27b-mtp-ud',
+            api_key: 'key',
+            available: false
+        },
+        {
+            host: '192.168.8.234',
+            port: 1234,
+            model: 'gemma-4-e4b-it-mlx@4bit',
+            api_key: 'key',
             available: false
         }
     ],
@@ -111,8 +121,8 @@ function loadConfig() {
                 }
             };
             
-            let tomlStr = `# llama-cpp-agent-proxy configuration\n\n` + 
-                `[network]\ntarget_host = "${defaultConfig.network.target_host}"\ntarget_port = ${defaultConfig.network.target_port}\nports = ${JSON.stringify(defaultConfig.network.ports)}\nnon_stop_ports = ${JSON.stringify(defaultConfig.network.non_stop_ports)}\n\n` +
+            let tomlStr = `# llama-cpp-agent-proxy configuration\n\n` +
+                `[network]\ntarget_host = "${defaultConfig.network.target_host}"\ntarget_port = ${defaultConfig.network.target_port}\nports = ${JSON.stringify(defaultConfig.network.ports)}\nnon_stop_ports = ${JSON.stringify(defaultConfig.network.non_stop_ports)}\nmax_response_tokens = ${MAX_RESPONSE_TOKENS}\n\n` +
                 `[backends]\nports = ${JSON.stringify(defaultConfig.backends.ports)}\nservices = ${JSON.stringify(defaultConfig.backends.services)}\nmonitor_enabled = ${defaultConfig.backends.monitor_enabled}\n\n`;
             
             defaultConfig.redirects.forEach(r => {
@@ -137,6 +147,9 @@ function loadConfig() {
         if (parsed.network) {
             TARGET_HOST = process.env.TARGET_HOST || parsed.network.target_host || TARGET_HOST;
             TARGET_PORT = parseInt(process.env.TARGET_PORT || (parsed.network.target_port ? parsed.network.target_port.toString() : null) || TARGET_PORT.toString(), 10);
+            if (parsed.network.max_response_tokens !== undefined) {
+                MAX_RESPONSE_TOKENS = parseInt(process.env.MAX_RESPONSE_TOKENS || parsed.network.max_response_tokens, 10);
+            }
         }
         
         if (parsed.redirects && Array.isArray(parsed.redirects)) {
@@ -824,7 +837,8 @@ function createRequestHandler(port, isNonStop, isEnforced) {
 
 
         if (isModels) {
-            Promise.all(BACKEND_CONFIGS.map(config => {
+            const modelsSources = [...BACKEND_CONFIGS, { host: '192.168.8.151', port: 11434, service: 'llama-server-redirect', logFile: null }];
+            Promise.all(modelsSources.map(config => {
                 return new Promise((resolve) => {
                     const pReq = http.request({ hostname: config.host, port: config.port, path: req.url, method: req.method, headers: { 'host': `${config.host}:${config.port}` } });
                     pReq.on('response', (pRes) => {
@@ -871,6 +885,10 @@ function createRequestHandler(port, isNonStop, isEnforced) {
                 try {
                     let json = JSON.parse(body);
                     json = normalizeRequestJson(json);
+                    // Enforce max response tokens (default 4k) unless client already set it
+                    if (MAX_RESPONSE_TOKENS > 0 && !json.max_tokens && !json.n_predict) {
+                        json.max_tokens = MAX_RESPONSE_TOKENS;
+                    }
                     let tPort = TARGET_PORT;
                     let tHost = TARGET_HOST;
                     const isAllModel = json.model === 'all';

@@ -71,15 +71,15 @@ services = ["llama-server-main", "lms-micro"]
 monitor_enabled = true
 
 [[redirects]]
-host = "192.168.8.234"
-port = 1234
-model = "gemma-4-e4b-it-mlx@4bit"
-api_key = ""
-
-[[redirects]]
 host = "192.168.8.47"
 port = 11434
 model = "qwen3.6-27b-mtp-ud"
+api_key = ""
+
+[[redirects]]
+host = "192.168.8.234"
+port = 1234
+model = "gemma-4-e4b-it-mlx@4bit"
 api_key = ""
 
 [logging]

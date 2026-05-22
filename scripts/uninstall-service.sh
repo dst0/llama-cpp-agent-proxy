@@ -48,8 +48,22 @@ kill_proxy_processes() {
 
     if [[ -n "${pids}" ]]; then
         for pid in ${pids}; do
+            echo "Killing proxy process: PID ${pid}"
             kill "${pid}" 2>/dev/null || true
         done
+        # Wait briefly and verify they're gone
+        sleep 0.5
+        local remaining
+        remaining="$(ps -eo pid=,command= | awk -v root="${ROOT_DIR}/index.js" '$0 ~ root {print $1}')"
+        if [[ -n "${remaining}" ]]; then
+            echo "Some processes still alive, force-killing..."
+            for pid in ${remaining}; do
+                echo "Force-killing proxy process: PID ${pid}"
+                kill -9 "${pid}" 2>/dev/null || true
+            done
+        fi
+    else
+        echo "No proxy processes found."
     fi
 }
 

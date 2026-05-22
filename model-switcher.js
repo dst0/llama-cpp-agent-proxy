@@ -10,12 +10,14 @@ export const OFFLINE_MODELS = [
     {
         id: "qwen36-35b-iq1",
         alias: "qwen36-35b-iq1",
-        modelPath: "/home/dst/models/unsloth_Qwen3.6-35B-A3B-GGUF_Qwen3.6-35B-A3B-UD-IQ1_M.gguf"
+        modelPath: "/home/dst/models/unsloth_Qwen3.6-35B-A3B-GGUF_Qwen3.6-35B-A3B-UD-IQ1_M.gguf",
+        mmprojPath: "/home/dst/models/unsloth_Qwen3.6-35B-A3B-GGUF_mmproj-BF16.gguf"
     },
     {
         id: "qwen36-27b",
         alias: "qwen36-27b-q3km",
-        modelPath: "/home/dst/models/unsloth/Qwen3.6-27B-Q3KM/Qwen3.6-27B-Q3_K_M.gguf"
+        modelPath: "/home/dst/models/unsloth/Qwen3.6-27B-Q3KM/Qwen3.6-27B-Q3_K_M.gguf",
+        mmprojPath: "/home/dst/models/mmproj-Qwen_Qwen3.5-27B-f16.gguf"
     }
 ];
 
@@ -55,6 +57,9 @@ export async function switchModel(targetModelId, targetPort, log = console.log) 
 
             envContent = updateOrAdd(envContent, 'MODEL', targetConfig.modelPath);
             envContent = updateOrAdd(envContent, 'ALIAS', targetConfig.alias);
+            if (targetConfig.mmprojPath) {
+                envContent = updateOrAdd(envContent, 'LLAMA_ARG_MMPROJ', targetConfig.mmprojPath);
+            }
             
             const tmpPath = path.join(os.tmpdir(), `llama-server-env-${Date.now()}.tmp`);
             fs.writeFileSync(tmpPath, envContent);
